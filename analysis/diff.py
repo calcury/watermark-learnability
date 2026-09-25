@@ -31,7 +31,9 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Keep Transformers lazy-imported: huggingface_hub reads HF_ENDPOINT at import
+# time, so setting it after importing Transformers is too late.
 
 DEFAULT_STUDENT = "cygu/llama-2-7b-logit-watermark-distill-kgw-k1-gamma0.25-delta2"
 DEFAULT_TEACHER = "meta-llama/Llama-2-7b-hf"
@@ -62,6 +64,14 @@ def parse_args():
     return parser.parse_args()
 
 
+def configure_endpoint(endpoint: str):
+    """Configure the mirror before importing Transformers/huggingface_hub."""
+    endpoint = endpoint.rstrip("/")
+    os.environ["HF_ENDPOINT"] = endpoint
+    os.environ["HF_HUB_ENDPOINT"] = endpoint
+    return endpoint
+
+
 def get_prompts(args) -> List[str]:
     if args.prompts:
         prompts = args.prompts
@@ -78,11 +88,11 @@ def get_prompts(args) -> List[str]:
 
 def load_model(model_id: str, device: torch.device, trust_remote_code: bool, quantization: str, endpoint: str, token: str):
     """Load one model, preferably quantized, without making a second RAM copy."""
-    # Set this before Transformers/huggingface_hub perform any downloads.
-    os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
+    endpoint = configure_endpoint(endpoint)
     load_kwargs = {"use_fast": True, "trust_remote_code": trust_remote_code}
     if token:
         load_kwargs["token"] = token
+    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id, **load_kwargs)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -117,6 +127,7 @@ def load_model(model_id: str, device: torch.device, trust_remote_code: bool, qua
         kwargs["device_map"] = {"": 0}
     else:
         kwargs["torch_dtype"] = torch.float16 if device.type == "cuda" else torch.float32
+    from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     if not use_4bit:
         model.to(device)
@@ -214,6 +225,8 @@ def save_results(rows: List[Dict[str, float]], output_dir: Path):
 
 def main():
     args = parse_args()
+    # Must happen before the lazy Transformers import in load_model.
+    args.hf_endpoint = configure_endpoint(args.hf_endpoint)
     prompts = get_prompts(args)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
