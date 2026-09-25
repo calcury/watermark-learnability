@@ -7,6 +7,11 @@ Colab usage (run from the repository root)::
     # Restart the Colab runtime after installing/upgrading these packages.
     !python analysis/diff.py
 
+Downloads use ``https://hf-mirror.com`` by default. To use the official
+endpoint instead, add ``--hf-endpoint https://huggingface.co``. A mirror can
+improve connectivity but cannot bypass a gated model's permission requirement;
+for Llama 2, accept the license and set ``HF_TOKEN`` when required.
+
 The default ``--quantization auto`` loads one model at a time in 4-bit on a
 Colab GPU. This is important for 12 GB RAM / 15 GB VRAM runtimes. Use
 ``--quantization none`` only on a machine with enough memory.
@@ -20,6 +25,7 @@ import argparse
 import csv
 import gc
 import importlib.metadata
+import os
 from pathlib import Path
 from typing import Dict, List
 
@@ -50,6 +56,8 @@ def parse_args():
     parser.add_argument("--output-dir", default="analysis/diff_output", help="Directory for CSV and plots")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="Inference device")
     parser.add_argument("--quantization", default="auto", choices=["auto", "4bit", "none"], help="Model loading mode; auto uses 4-bit on CUDA")
+    parser.add_argument("--hf-endpoint", default=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"), help="Hugging Face endpoint (default: hf-mirror.com; also sets HF_ENDPOINT)")
+    parser.add_argument("--token", default=os.environ.get("HF_TOKEN"), help="Optional Hugging Face access token, or set HF_TOKEN")
     parser.add_argument("--trust-remote-code", action="store_true", help="Allow custom model code from Hugging Face")
     return parser.parse_args()
 
@@ -68,13 +76,22 @@ def get_prompts(args) -> List[str]:
     return prompts
 
 
-def load_model(model_id: str, device: torch.device, trust_remote_code: bool, quantization: str):
+def load_model(model_id: str, device: torch.device, trust_remote_code: bool, quantization: str, endpoint: str, token: str):
     """Load one model, preferably quantized, without making a second RAM copy."""
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=trust_remote_code)
+    # Set this before Transformers/huggingface_hub perform any downloads.
+    os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
+    load_kwargs = {"use_fast": True, "trust_remote_code": trust_remote_code}
+    if token:
+        load_kwargs["token"] = token
+    tokenizer = AutoTokenizer.from_pretrained(model_id, **load_kwargs)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     use_4bit = quantization == "4bit" or (quantization == "auto" and device.type == "cuda")
+    # Set this before Transformers/huggingface_hub perform any downloads.
+    os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
     kwargs = {"low_cpu_mem_usage": True, "trust_remote_code": trust_remote_code}
+    if token:
+        kwargs["token"] = token
     if use_4bit:
         if device.type != "cuda":
             raise ValueError("4-bit quantization requires CUDA; use --quantization none on CPU")
@@ -206,14 +223,15 @@ def main():
         raise RuntimeError("CUDA was requested but is not available")
     print(f"Device: {device}; prompts: {len(prompts)}; max length: {args.max_length}")
     print(f"Loading student: {args.student}")
-    student_tokenizer, student_model = load_model(args.student, device, args.trust_remote_code, args.quantization)
+    print(f"Hugging Face endpoint: {args.hf_endpoint}")
+    student_tokenizer, student_model = load_model(args.student, device, args.trust_remote_code, args.quantization, args.hf_endpoint, args.token)
     student_states = collect_hidden_states(student_tokenizer, student_model, prompts, device, args.max_length, args.batch_size)
     del student_model, student_tokenizer
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     print(f"Loading teacher: {args.teacher}")
-    teacher_tokenizer, teacher_model = load_model(args.teacher, device, args.trust_remote_code, args.quantization)
+    teacher_tokenizer, teacher_model = load_model(args.teacher, device, args.trust_remote_code, args.quantization, args.hf_endpoint, args.token)
     teacher_states = collect_hidden_states(teacher_tokenizer, teacher_model, prompts, device, args.max_length, args.batch_size)
     rows = compare_layers(student_states, teacher_states)
     print("\nPer-layer representation differences (token-weighted over prompts):")
