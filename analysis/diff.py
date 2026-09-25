@@ -3,8 +3,12 @@
 
 Colab usage (run from the repository root)::
 
-    !pip install -q transformers accelerate matplotlib
+    !pip install -q transformers accelerate matplotlib bitsandbytes
     !python analysis/diff.py
+
+The default ``--quantization auto`` loads one model at a time in 4-bit on a
+Colab GPU. This is important for 12 GB RAM / 15 GB VRAM runtimes. Use
+``--quantization none`` only on a machine with enough memory.
 
 The script uses paired prompts for both models and reports per-layer cosine
  distance, normalized L2 distance, and linear CKA. A CSV and diagnostic plots
@@ -43,6 +47,7 @@ def parse_args():
     parser.add_argument("--max-prompts", type=int, default=5, help="Limit prompts when using --prompt-file")
     parser.add_argument("--output-dir", default="analysis/diff_output", help="Directory for CSV and plots")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="Inference device")
+    parser.add_argument("--quantization", default="auto", choices=["auto", "4bit", "none"], help="Model loading mode; auto uses 4-bit on CUDA")
     parser.add_argument("--trust-remote-code", action="store_true", help="Allow custom model code from Hugging Face")
     return parser.parse_args()
 
@@ -61,19 +66,32 @@ def get_prompts(args) -> List[str]:
     return prompts
 
 
-def load_model(model_id: str, device: torch.device, trust_remote_code: bool):
-    # float16 greatly reduces memory use on Colab GPUs; use float32 on CPU.
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
+def load_model(model_id: str, device: torch.device, trust_remote_code: bool, quantization: str):
+    """Load one model, preferably quantized, without making a second RAM copy."""
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        trust_remote_code=trust_remote_code,
-    )
-    model.to(device)
+    use_4bit = quantization == "4bit" or (quantization == "auto" and device.type == "cuda")
+    kwargs = {"low_cpu_mem_usage": True, "trust_remote_code": trust_remote_code}
+    if use_4bit:
+        if device.type != "cuda":
+            raise ValueError("4-bit quantization requires CUDA; use --quantization none on CPU")
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise RuntimeError("Install bitsandbytes for Colab: !pip install -q bitsandbytes") from exc
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        kwargs["device_map"] = {"": 0}
+    else:
+        kwargs["torch_dtype"] = torch.float16 if device.type == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    if not use_4bit:
+        model.to(device)
     model.eval()
     return tokenizer, model
 
@@ -177,14 +195,14 @@ def main():
         raise RuntimeError("CUDA was requested but is not available")
     print(f"Device: {device}; prompts: {len(prompts)}; max length: {args.max_length}")
     print(f"Loading student: {args.student}")
-    student_tokenizer, student_model = load_model(args.student, device, args.trust_remote_code)
+    student_tokenizer, student_model = load_model(args.student, device, args.trust_remote_code, args.quantization)
     student_states = collect_hidden_states(student_tokenizer, student_model, prompts, device, args.max_length, args.batch_size)
     del student_model, student_tokenizer
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     print(f"Loading teacher: {args.teacher}")
-    teacher_tokenizer, teacher_model = load_model(args.teacher, device, args.trust_remote_code)
+    teacher_tokenizer, teacher_model = load_model(args.teacher, device, args.trust_remote_code, args.quantization)
     teacher_states = collect_hidden_states(teacher_tokenizer, teacher_model, prompts, device, args.max_length, args.batch_size)
     rows = compare_layers(student_states, teacher_states)
     print("\nPer-layer representation differences (token-weighted over prompts):")
