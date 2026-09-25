@@ -8,5 +8,9 @@ scikit-learn
 scipy
 torch
 tqdm
-transformers@git+https://github.com/chenchenygu/transformers-watermark-learnability
+# Use released wheels: the old project fork pins tokenizers 0.13.x, which has
+# no Python 3.13 wheel and therefore fails while building Rust code in Colab.
+transformers==4.48.3
+tokenizers==0.21.0
+matplotlib
 wandb
