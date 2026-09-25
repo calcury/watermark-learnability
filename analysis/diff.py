@@ -49,7 +49,7 @@ DEFAULT_PROMPTS = [
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--student", default=DEFAULT_STUDENT, help="Student/distilled model ID or local path")
-    parser.add_argument("--teacher", default=DEFAULT_TEACHER, help="Source Llama model ID or local path")
+    parser.add_argument("--teacher", default=DEFAULT_TEACHER, help="Source Llama model ID or local path; local path avoids gated Hub access")
     parser.add_argument("--prompts", nargs="*", default=None, help="Texts to compare (defaults to built-in prompts)")
     parser.add_argument("--prompt-file", help="UTF-8 text file with one prompt per line")
     parser.add_argument("--max-length", type=int, default=128, help="Maximum tokenized prompt length")
@@ -110,14 +110,45 @@ def get_prompts(args) -> List[str]:
     return prompts
 
 
+def resolve_model_path(model_id: str, endpoint: str, token: str) -> str:
+    """Download a Hub repo explicitly, then load only from its local snapshot.
+
+    Calling ``from_pretrained(repo_id)`` lets older Transformers versions use a
+    hard-coded huggingface.co URL. Explicit ``snapshot_download(endpoint=...)``
+    prevents that fallback and makes the actual download source deterministic.
+    """
+    if Path(model_id).exists():
+        return model_id
+    configure_endpoint(endpoint)
+    try:
+        from huggingface_hub import snapshot_download
+        kwargs = {"repo_id": model_id, "token": token, "endpoint": endpoint.rstrip("/")}
+        try:
+            path = snapshot_download(**kwargs)
+        except TypeError:
+            # Compatibility with older huggingface_hub without endpoint=.
+            os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
+            kwargs.pop("endpoint")
+            path = snapshot_download(**kwargs)
+        print(f"Downloaded {model_id} from {endpoint} to {path}")
+        return path
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not download {model_id} from {endpoint}. "
+            "If this is a gated Llama model, pass --teacher /path/to/local/model "
+            "or provide a valid HF_TOKEN accepted by the mirror."
+        ) from exc
+
+
 def load_model(model_id: str, device: torch.device, trust_remote_code: bool, quantization: str, endpoint: str, token: str):
     """Load one model, preferably quantized, without making a second RAM copy."""
     endpoint = configure_endpoint(endpoint)
-    load_kwargs = {"use_fast": True, "trust_remote_code": trust_remote_code}
+    model_path = resolve_model_path(model_id, endpoint, token)
+    load_kwargs = {"use_fast": True, "trust_remote_code": trust_remote_code, "local_files_only": True}
     if token:
         load_kwargs["token"] = token
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id, **load_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **load_kwargs)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     use_4bit = quantization == "4bit" or (quantization == "auto" and device.type == "cuda")
@@ -152,7 +183,8 @@ def load_model(model_id: str, device: torch.device, trust_remote_code: bool, qua
     else:
         kwargs["torch_dtype"] = torch.float16 if device.type == "cuda" else torch.float32
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    kwargs["local_files_only"] = True
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     if not use_4bit:
         model.to(device)
     model.eval()
