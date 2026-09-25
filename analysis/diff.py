@@ -65,10 +65,34 @@ def parse_args():
 
 
 def configure_endpoint(endpoint: str):
-    """Configure the mirror before importing Transformers/huggingface_hub."""
+    """Force every loaded Hub/Transformers module to use ``endpoint``.
+
+    Some Colab images ship an older ``huggingface_hub`` where the endpoint is
+    copied into module constants at import time. Environment variables alone
+    then do not take effect, so patch both the environment and known constants.
+    """
     endpoint = endpoint.rstrip("/")
     os.environ["HF_ENDPOINT"] = endpoint
     os.environ["HF_HUB_ENDPOINT"] = endpoint
+    try:
+        import huggingface_hub.constants as hub_constants
+        hub_constants.ENDPOINT = endpoint
+        hub_constants.HF_ENDPOINT = endpoint
+        import huggingface_hub.file_download as file_download
+        if hasattr(file_download, "ENDPOINT"):
+            file_download.ENDPOINT = endpoint
+        if hasattr(file_download, "HF_ENDPOINT"):
+            file_download.HF_ENDPOINT = endpoint
+    except ImportError:
+        pass
+    try:
+        import transformers.utils.hub as transformers_hub
+        if hasattr(transformers_hub, "ENDPOINT"):
+            transformers_hub.ENDPOINT = endpoint
+        if hasattr(transformers_hub, "HUGGINGFACE_CO_PREFIX"):
+            transformers_hub.HUGGINGFACE_CO_PREFIX = endpoint + "/"
+    except ImportError:
+        pass
     return endpoint
 
 
@@ -227,6 +251,7 @@ def main():
     args = parse_args()
     # Must happen before the lazy Transformers import in load_model.
     args.hf_endpoint = configure_endpoint(args.hf_endpoint)
+    print(f"Hugging Face endpoint forced to: {args.hf_endpoint}")
     prompts = get_prompts(args)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
