@@ -3,7 +3,8 @@
 
 Colab usage (run from the repository root)::
 
-    !pip install -q transformers accelerate matplotlib bitsandbytes
+    !pip install -q -U transformers accelerate matplotlib bitsandbytes
+    # Restart the Colab runtime after installing/upgrading these packages.
     !python analysis/diff.py
 
 The default ``--quantization auto`` loads one model at a time in 4-bit on a
@@ -18,6 +19,7 @@ are written under ``analysis/diff_output`` by default.
 import argparse
 import csv
 import gc
+import importlib.metadata
 from pathlib import Path
 from typing import Dict, List
 
@@ -77,9 +79,18 @@ def load_model(model_id: str, device: torch.device, trust_remote_code: bool, qua
         if device.type != "cuda":
             raise ValueError("4-bit quantization requires CUDA; use --quantization none on CPU")
         try:
+            bnb_version = importlib.metadata.version("bitsandbytes")
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                "bitsandbytes is not installed in this runtime (or its metadata is stale). "
+                "Run `!pip install -q -U bitsandbytes transformers`, then restart the Colab runtime. "
+                "Alternatively run with `--quantization none` (uses much more memory)."
+            ) from exc
+        try:
             from transformers import BitsAndBytesConfig
         except ImportError as exc:
-            raise RuntimeError("Install bitsandbytes for Colab: !pip install -q bitsandbytes") from exc
+            raise RuntimeError("Install a recent transformers and bitsandbytes: !pip install -q -U transformers bitsandbytes") from exc
+        print(f"Using 4-bit bitsandbytes quantization (bitsandbytes {bnb_version})")
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
