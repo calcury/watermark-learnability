@@ -1,42 +1,33 @@
 #!/usr/bin/env python
-"""Compare hidden-state distributions of a watermark-distilled Llama and its teacher.
+"""Compare layerwise representations of a watermark-distilled model and its base model.
 
 Colab usage (run from the repository root)::
 
-    !pip install -q -U transformers accelerate matplotlib bitsandbytes
-    # Restart the Colab runtime after installing/upgrading these packages.
+    !pip install -q -U transformers matplotlib
+    !python analysis/fetch_model.py   # downloads to pretrained/
     !python analysis/diff.py
 
-Downloads use ``https://hf-mirror.com`` by default. To use the official
-endpoint instead, add ``--hf-endpoint https://huggingface.co``. A mirror can
-improve connectivity but cannot bypass a gated model's permission requirement;
-for Llama 2, accept the license and set ``HF_TOKEN`` when required.
+``diff.py`` never touches the network: it loads the two models from the local
+``pretrained/`` directories created by ``fetch_model.py``. Both Pythia models
+are small (about 2.8 GB in fp16), and they are still loaded one at a time so the
+run stays inside a 12 GB RAM / 15 GB VRAM Colab runtime.
 
-The default ``--quantization auto`` loads one model at a time in 4-bit on a
-Colab GPU. This is important for 12 GB RAM / 15 GB VRAM runtimes. Use
-``--quantization none`` only on a machine with enough memory.
-
-The script uses paired prompts for both models and reports per-layer cosine
- distance, normalized L2 distance, and linear CKA. A CSV and diagnostic plots
-are written under ``analysis/diff_output`` by default.
+For every hidden-state layer the script reports the distribution of per-token
+cosine distance, normalized L2 distance, and linear CKA, prints a table, and
+writes ``layer_distances.csv`` plus two figures under ``analysis/diff_output``.
 """
 
 import argparse
 import csv
 import gc
-import importlib.metadata
-import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
 
-# Keep Transformers lazy-imported: huggingface_hub reads HF_ENDPOINT at import
-# time, so setting it after importing Transformers is too late.
-
-DEFAULT_STUDENT = "cygu/llama-2-7b-logit-watermark-distill-kgw-k1-gamma0.25-delta2"
-DEFAULT_TEACHER = "meta-llama/Llama-2-7b-hf"
+DEFAULT_WATERMARKED = "pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta2"
+DEFAULT_BASE = "pretrained/pythia-1.4b"
 DEFAULT_PROMPTS = [
     "The history of science is a story of people asking questions about the world.",
     "A good education helps people understand their communities and make informed decisions.",
@@ -48,8 +39,8 @@ DEFAULT_PROMPTS = [
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--student", default=DEFAULT_STUDENT, help="Student/distilled model ID or local path")
-    parser.add_argument("--teacher", default=DEFAULT_TEACHER, help="Source Llama model ID or local path; local path avoids gated Hub access")
+    parser.add_argument("--watermarked", default=DEFAULT_WATERMARKED, help="Local directory of the watermark-distilled model")
+    parser.add_argument("--base", default=DEFAULT_BASE, help="Local directory of the base/original model")
     parser.add_argument("--prompts", nargs="*", default=None, help="Texts to compare (defaults to built-in prompts)")
     parser.add_argument("--prompt-file", help="UTF-8 text file with one prompt per line")
     parser.add_argument("--max-length", type=int, default=128, help="Maximum tokenized prompt length")
@@ -57,43 +48,8 @@ def parse_args():
     parser.add_argument("--max-prompts", type=int, default=5, help="Limit prompts when using --prompt-file")
     parser.add_argument("--output-dir", default="analysis/diff_output", help="Directory for CSV and plots")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="Inference device")
-    parser.add_argument("--quantization", default="auto", choices=["auto", "4bit", "none"], help="Model loading mode; auto uses 4-bit on CUDA")
-    parser.add_argument("--hf-endpoint", default=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"), help="Hugging Face endpoint (default: hf-mirror.com; also sets HF_ENDPOINT)")
-    parser.add_argument("--token", default=os.environ.get("HF_TOKEN"), help="Optional Hugging Face access token, or set HF_TOKEN")
-    parser.add_argument("--trust-remote-code", action="store_true", help="Allow custom model code from Hugging Face")
+    parser.add_argument("--trust-remote-code", action="store_true", help="Allow custom model code from the local directory")
     return parser.parse_args()
-
-
-def configure_endpoint(endpoint: str):
-    """Force every loaded Hub/Transformers module to use ``endpoint``.
-
-    Some Colab images ship an older ``huggingface_hub`` where the endpoint is
-    copied into module constants at import time. Environment variables alone
-    then do not take effect, so patch both the environment and known constants.
-    """
-    endpoint = endpoint.rstrip("/")
-    os.environ["HF_ENDPOINT"] = endpoint
-    os.environ["HF_HUB_ENDPOINT"] = endpoint
-    try:
-        import huggingface_hub.constants as hub_constants
-        hub_constants.ENDPOINT = endpoint
-        hub_constants.HF_ENDPOINT = endpoint
-        import huggingface_hub.file_download as file_download
-        if hasattr(file_download, "ENDPOINT"):
-            file_download.ENDPOINT = endpoint
-        if hasattr(file_download, "HF_ENDPOINT"):
-            file_download.HF_ENDPOINT = endpoint
-    except ImportError:
-        pass
-    try:
-        import transformers.utils.hub as transformers_hub
-        if hasattr(transformers_hub, "ENDPOINT"):
-            transformers_hub.ENDPOINT = endpoint
-        if hasattr(transformers_hub, "HUGGINGFACE_CO_PREFIX"):
-            transformers_hub.HUGGINGFACE_CO_PREFIX = endpoint + "/"
-    except ImportError:
-        pass
-    return endpoint
 
 
 def get_prompts(args) -> List[str]:
@@ -110,103 +66,82 @@ def get_prompts(args) -> List[str]:
     return prompts
 
 
-def resolve_model_path(model_id: str, endpoint: str, token: str) -> str:
-    """Download a Hub repo explicitly, then load only from its local snapshot.
-
-    Calling ``from_pretrained(repo_id)`` lets older Transformers versions use a
-    hard-coded huggingface.co URL. Explicit ``snapshot_download(endpoint=...)``
-    prevents that fallback and makes the actual download source deterministic.
-    """
-    if Path(model_id).exists():
-        return model_id
-    configure_endpoint(endpoint)
-    try:
-        from huggingface_hub import snapshot_download
-        kwargs = {"repo_id": model_id, "token": token, "endpoint": endpoint.rstrip("/")}
-        try:
-            path = snapshot_download(**kwargs)
-        except TypeError:
-            # Compatibility with older huggingface_hub without endpoint=.
-            os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
-            kwargs.pop("endpoint")
-            path = snapshot_download(**kwargs)
-        print(f"Downloaded {model_id} from {endpoint} to {path}")
-        return path
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not download {model_id} from {endpoint}. "
-            "If this is a gated Llama model, pass --teacher /path/to/local/model "
-            "or provide a valid HF_TOKEN accepted by the mirror."
-        ) from exc
+def check_local_dir(path: str, flag: str) -> Path:
+    model_dir = Path(path)
+    if not model_dir.is_dir():
+        raise FileNotFoundError(
+            f"{flag} directory not found: {model_dir}\n"
+            "Run `python analysis/fetch_model.py` first to download the models into pretrained/."
+        )
+    if not (model_dir / "config.json").is_file():
+        raise FileNotFoundError(f"{model_dir} has no config.json; re-run `python analysis/fetch_model.py`")
+    return model_dir
 
 
-def load_model(model_id: str, device: torch.device, trust_remote_code: bool, quantization: str, endpoint: str, token: str):
-    """Load one model, preferably quantized, without making a second RAM copy."""
-    endpoint = configure_endpoint(endpoint)
-    model_path = resolve_model_path(model_id, endpoint, token)
-    load_kwargs = {"use_fast": True, "trust_remote_code": trust_remote_code, "local_files_only": True}
-    if token:
-        load_kwargs["token"] = token
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, **load_kwargs)
+def load_model(model_dir: Path, device: torch.device, trust_remote_code: bool):
+    """Load one model from disk in fp16 on CUDA / fp32 on CPU."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True, local_files_only=True, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    use_4bit = quantization == "4bit" or (quantization == "auto" and device.type == "cuda")
-    # Set this before Transformers/huggingface_hub perform any downloads.
-    os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
-    kwargs = {"low_cpu_mem_usage": True, "trust_remote_code": trust_remote_code}
-    if token:
-        kwargs["token"] = token
-    if use_4bit:
-        if device.type != "cuda":
-            raise ValueError("4-bit quantization requires CUDA; use --quantization none on CPU")
-        try:
-            bnb_version = importlib.metadata.version("bitsandbytes")
-        except importlib.metadata.PackageNotFoundError as exc:
-            raise RuntimeError(
-                "bitsandbytes is not installed in this runtime (or its metadata is stale). "
-                "Run `!pip install -q -U bitsandbytes transformers`, then restart the Colab runtime. "
-                "Alternatively run with `--quantization none` (uses much more memory)."
-            ) from exc
-        try:
-            from transformers import BitsAndBytesConfig
-        except ImportError as exc:
-            raise RuntimeError("Install a recent transformers and bitsandbytes: !pip install -q -U transformers bitsandbytes") from exc
-        print(f"Using 4-bit bitsandbytes quantization (bitsandbytes {bnb_version})")
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        kwargs["device_map"] = {"": 0}
-    else:
-        kwargs["torch_dtype"] = torch.float16 if device.type == "cuda" else torch.float32
-    from transformers import AutoModelForCausalLM
-    kwargs["local_files_only"] = True
-    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
-    if not use_4bit:
-        model.to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        low_cpu_mem_usage=True,
+        local_files_only=True,
+        trust_remote_code=trust_remote_code,
+    )
+    model.to(device)
     model.eval()
     return tokenizer, model
 
 
-def collect_hidden_states(tokenizer, model, prompts: List[str], device, max_length: int, batch_size: int):
+def tokenize_prompts(tokenizer, prompts: Sequence[str], max_length: int, batch_size: int):
+    """Tokenize once so both models see byte-identical inputs."""
+    batches = []
+    for start in range(0, len(prompts), batch_size):
+        batches.append(
+            tokenizer(
+                list(prompts[start : start + batch_size]),
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+        )
+    return batches
+
+
+def check_same_tokenization(base_batches, watermarked_batches):
+    for index, (base, watermarked) in enumerate(zip(base_batches, watermarked_batches)):
+        for key in ("input_ids", "attention_mask"):
+            if not torch.equal(base[key], watermarked[key]):
+                raise RuntimeError(
+                    f"The two models tokenize prompt batch {index} differently ({key}); "
+                    "a token-level comparison would not be valid."
+                )
+
+
+def collect_hidden_states(model, batches, device: torch.device) -> List[np.ndarray]:
     """Return per-layer matrices of masked token activations on CPU."""
     collected: List[List[torch.Tensor]] = [[] for _ in range(model.config.num_hidden_layers + 1)]
-    for start in range(0, len(prompts), batch_size):
-        batch = prompts[start : start + batch_size]
-        encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
-        encoded = {key: value.to(device) for key, value in encoded.items()}
+    for encoded in batches:
+        inputs = {key: value.to(device) for key, value in encoded.items()}
         with torch.inference_mode():
-            result = model(**encoded, output_hidden_states=True, use_cache=False, return_dict=True)
-        mask = encoded["attention_mask"].bool()
+            result = model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
+        mask = inputs["attention_mask"].bool()
         for layer, state in enumerate(result.hidden_states):
-            # Pool each token as a sample; mask padding so lengths do not bias metrics.
-            values = state[mask].detach().to(dtype=torch.float32, device="cpu")
-            collected[layer].append(values)
-        del result, encoded
+            # Every non-padding token is one sample; padding is masked out.
+            collected[layer].append(state[mask].detach().to(dtype=torch.float32, device="cpu"))
+        del result, inputs
     return [torch.cat(chunks, dim=0).numpy() for chunks in collected]
+
+
+def per_token_cosine_distance(student: np.ndarray, teacher: np.ndarray) -> np.ndarray:
+    s_norm = np.linalg.norm(student, axis=1).clip(min=1e-12)
+    t_norm = np.linalg.norm(teacher, axis=1).clip(min=1e-12)
+    return (1.0 - np.sum(student * teacher, axis=1) / (s_norm * t_norm)).astype(np.float64)
 
 
 def linear_cka(x: np.ndarray, y: np.ndarray) -> float:
@@ -222,47 +157,57 @@ def linear_cka(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.sum(cross * cross) / denom) if denom > 0 else float("nan")
 
 
-def compare_layers(student_states, teacher_states) -> List[Dict[str, float]]:
+def compare_layers(
+    student_states: Sequence[np.ndarray], teacher_states: Sequence[np.ndarray]
+) -> Tuple[List[Dict[str, float]], List[np.ndarray]]:
+    """Return per-layer summary rows and the per-token cosine distance arrays."""
     if len(student_states) != len(teacher_states):
         raise ValueError(f"Models expose different layer counts: {len(student_states)} vs {len(teacher_states)}")
-    rows = []
+    rows: List[Dict[str, float]] = []
+    distributions: List[np.ndarray] = []
     for layer, (student, teacher) in enumerate(zip(student_states, teacher_states)):
-        if student.shape[0] != teacher.shape[0]:
-            raise ValueError("Models tokenized prompts to different numbers of tokens; use compatible tokenizers/prompt lengths")
-        # Per-token cosine distance, aggregated across all prompt tokens.
-        s_norm = np.linalg.norm(student, axis=1).clip(min=1e-12)
-        t_norm = np.linalg.norm(teacher, axis=1).clip(min=1e-12)
-        cosine_distance = float(np.mean(1.0 - np.sum(student * teacher, axis=1) / (s_norm * t_norm)))
+        if student.shape != teacher.shape:
+            raise ValueError(f"Layer {layer} shapes differ: {student.shape} vs {teacher.shape}")
+        student = student.astype(np.float64, copy=False)
+        teacher = teacher.astype(np.float64, copy=False)
+        distances = per_token_cosine_distance(student, teacher)
         teacher_rms = float(np.sqrt(np.mean(np.square(teacher))))
-        normalized_l2 = float(np.sqrt(np.mean(np.square(student - teacher))) / max(teacher_rms, 1e-12))
         rows.append({
             "layer": layer,
-            "cosine_distance": cosine_distance,
-            "normalized_l2": normalized_l2,
+            "cosine_distance_mean": float(distances.mean()),
+            "cosine_distance_std": float(distances.std()),
+            "cosine_distance_p05": float(np.quantile(distances, 0.05)),
+            "cosine_distance_p50": float(np.quantile(distances, 0.50)),
+            "cosine_distance_p95": float(np.quantile(distances, 0.95)),
+            "normalized_l2": float(np.sqrt(np.mean(np.square(student - teacher))) / max(teacher_rms, 1e-12)),
             "linear_cka": linear_cka(student, teacher),
             "student_rms": float(np.sqrt(np.mean(np.square(student)))),
             "teacher_rms": teacher_rms,
+            "tokens": int(student.shape[0]),
         })
-    return rows
+        distributions.append(distances)
+    return rows, distributions
 
 
-def save_results(rows: List[Dict[str, float]], output_dir: Path):
+def save_results(rows: List[Dict[str, float]], distributions: List[np.ndarray], output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "layer_distances.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-    # Lazy import keeps metrics usable in minimal installations; matplotlib is installed in Colab.
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     layers = [row["layer"] for row in rows]
+
+    # Figure 1: how each summary metric evolves with depth.
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
     for ax, key, title, color in zip(
         axes,
-        ("cosine_distance", "normalized_l2", "linear_cka"),
+        ("cosine_distance_mean", "normalized_l2", "linear_cka"),
         ("Cosine distance (lower is closer)", "Normalized RMS L2 (lower is closer)", "Linear CKA (higher is more similar)"),
         ("#d95f02", "#1b9e77", "#7570b3"),
     ):
@@ -271,19 +216,34 @@ def save_results(rows: List[Dict[str, float]], output_dir: Path):
         ax.set_ylabel(key.replace("_", " "))
         ax.set_title(title)
         ax.grid(True, alpha=0.25)
-    fig.suptitle("Student vs source model representation differences")
+    fig.suptitle("Watermark-distilled Pythia vs base Pythia: per-layer differences")
     fig.tight_layout()
-    plot_path = output_dir / "layer_distances.png"
-    fig.savefig(plot_path, dpi=160, bbox_inches="tight")
+    metrics_path = output_dir / "layer_metrics.png"
+    fig.savefig(metrics_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
-    return csv_path, plot_path
+
+    # Figure 2: the per-token cosine-distance distribution of every layer.
+    fig2, ax2 = plt.subplots(figsize=(max(8, 0.45 * len(layers)), 6))
+    ax2.boxplot(distributions, positions=layers, widths=0.6, showfliers=False, patch_artist=True,
+                boxprops={"facecolor": "#a6cee3", "edgecolor": "#1f78b4"},
+                medianprops={"color": "#d95f02", "linewidth": 1.6},
+                whiskerprops={"color": "#1f78b4"}, capprops={"color": "#1f78b4"})
+    ax2.set_xlabel("Hidden-state layer (0 = embeddings)")
+    ax2.set_ylabel("Per-token cosine distance to base model")
+    ax2.set_title("Layerwise distribution of representation distances (box = IQR, whiskers = 5-95%)")
+    ax2.grid(True, axis="y", alpha=0.25)
+    fig2.tight_layout()
+    distribution_path = output_dir / "layer_distance_distribution.png"
+    fig2.savefig(distribution_path, dpi=160, bbox_inches="tight")
+    plt.close(fig2)
+
+    return csv_path, metrics_path, distribution_path
 
 
 def main():
     args = parse_args()
-    # Must happen before the lazy Transformers import in load_model.
-    args.hf_endpoint = configure_endpoint(args.hf_endpoint)
-    print(f"Hugging Face endpoint forced to: {args.hf_endpoint}")
+    watermarked_dir = check_local_dir(args.watermarked, "--watermarked")
+    base_dir = check_local_dir(args.base, "--base")
     prompts = get_prompts(args)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -291,26 +251,55 @@ def main():
         device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
+
     print(f"Device: {device}; prompts: {len(prompts)}; max length: {args.max_length}")
-    print(f"Loading student: {args.student}")
-    print(f"Hugging Face endpoint: {args.hf_endpoint}")
-    student_tokenizer, student_model = load_model(args.student, device, args.trust_remote_code, args.quantization, args.hf_endpoint, args.token)
-    student_states = collect_hidden_states(student_tokenizer, student_model, prompts, device, args.max_length, args.batch_size)
-    del student_model, student_tokenizer
+    print(f"Watermarked model: {watermarked_dir}")
+    print(f"Base model:        {base_dir}")
+
+    # Tokenize with both tokenizers to prove the comparison is well defined.
+    from transformers import AutoTokenizer
+
+    base_tokenizer = AutoTokenizer.from_pretrained(base_dir, use_fast=True, local_files_only=True)
+    wm_tokenizer = AutoTokenizer.from_pretrained(watermarked_dir, use_fast=True, local_files_only=True)
+    for tokenizer in (base_tokenizer, wm_tokenizer):
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    batches = tokenize_prompts(base_tokenizer, prompts, args.max_length, args.batch_size)
+    check_same_tokenization(tokenize_prompts(wm_tokenizer, prompts, args.max_length, args.batch_size), batches)
+    tokens = sum(int(batch["attention_mask"].sum()) for batch in batches)
+    print(f"Tokenized {len(prompts)} prompts; {tokens} non-padding tokens compared per layer")
+    del base_tokenizer, wm_tokenizer
+
+    print("Loading watermarked model...")
+    _, watermarked_model = load_model(watermarked_dir, device, args.trust_remote_code)
+    watermarked_states = collect_hidden_states(watermarked_model, batches, device)
+    num_layers = len(watermarked_states)
+    del watermarked_model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    print(f"Loading teacher: {args.teacher}")
-    teacher_tokenizer, teacher_model = load_model(args.teacher, device, args.trust_remote_code, args.quantization, args.hf_endpoint, args.token)
-    teacher_states = collect_hidden_states(teacher_tokenizer, teacher_model, prompts, device, args.max_length, args.batch_size)
-    rows = compare_layers(student_states, teacher_states)
-    print("\nPer-layer representation differences (token-weighted over prompts):")
-    print(f"{'Layer':>5} {'Cosine dist':>13} {'Norm. L2':>12} {'Linear CKA':>12} {'Student RMS':>13} {'Teacher RMS':>13}")
+
+    print("Loading base model...")
+    _, base_model = load_model(base_dir, device, args.trust_remote_code)
+    base_states = collect_hidden_states(base_model, batches, device)
+    del base_model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    rows, distributions = compare_layers(watermarked_states, base_states)
+    print(f"\nLayerwise differences over {num_layers} layers (watermarked vs base, token-weighted):")
+    print(f"{'Layer':>5} {'CosDist mean':>13} {'std':>8} {'p05':>8} {'p50':>8} {'p95':>8} {'NormL2':>9} {'CKA':>8}")
     for row in rows:
-        print(f"{row['layer']:5d} {row['cosine_distance']:13.6f} {row['normalized_l2']:12.6f} {row['linear_cka']:12.6f} {row['student_rms']:13.6f} {row['teacher_rms']:13.6f}")
-    csv_path, plot_path = save_results(rows, Path(args.output_dir))
-    print(f"\nSaved metrics: {csv_path}")
-    print(f"Saved plot:    {plot_path}")
+        print(
+            f"{row['layer']:5d} {row['cosine_distance_mean']:13.6f} {row['cosine_distance_std']:8.4f} "
+            f"{row['cosine_distance_p05']:8.4f} {row['cosine_distance_p50']:8.4f} {row['cosine_distance_p95']:8.4f} "
+            f"{row['normalized_l2']:9.6f} {row['linear_cka']:8.6f}"
+        )
+    csv_path, metrics_path, distribution_path = save_results(rows, distributions, Path(args.output_dir))
+    print(f"\nSaved metrics:               {csv_path}")
+    print(f"Saved per-layer metric plot: {metrics_path}")
+    print(f"Saved distribution plot:     {distribution_path}")
 
 
 if __name__ == "__main__":

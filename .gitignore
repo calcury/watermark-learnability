@@ -1,0 +1,9 @@
+# Downloaded model weights (created by analysis/fetch_model.py)
+pretrained/
+
+# Analysis outputs
+analysis/diff_output/
+
+# Python
+__pycache__/
+*.py[cod]
