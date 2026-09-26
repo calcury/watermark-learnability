@@ -23,10 +23,12 @@ training A1/A2 and then distilling each with the same script and seed.
 ```python
 !pip install -q -U transformers datasets accelerate matplotlib
 !python analysis/fetch_model.py
-# B1 = pretrained/pythia-1.4b; B2 = the downloaded watermark checkpoint
+# B1 = pretrained/pythia-1.4b; compare k=0, k=1, and k=2 checkpoints
 !python analysis/paired_diff.py \
   --b1 pretrained/pythia-1.4b \
   --b2 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta2 \
+  --k0 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta2 \
+  --k2 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta2 \
   --prompt-file data/probe.tsv \
   --output-dir analysis/paired_diff_output
 ```

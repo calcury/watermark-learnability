@@ -40,7 +40,9 @@ DEFAULT_PROMPTS = [
 def args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--b1", default=DEFAULT_B1, help="Normal student B1 local directory")
-    p.add_argument("--b2", default=DEFAULT_B2, help="Watermark student B2 local directory")
+    p.add_argument("--b2", default=DEFAULT_B2, help="Legacy k=1 watermark student B2 local directory")
+    p.add_argument("--k0", default=None, help="Optional k=0 watermark student local directory")
+    p.add_argument("--k2", default=None, help="Optional k=2 watermark student local directory")
     p.add_argument("--a1", default=None, help="Optional normal teacher A1 local directory")
     p.add_argument("--a2", default=None, help="Optional watermarked teacher A2 local directory")
     p.add_argument("--prompt-file", help="UTF-8 lines: prompt, or group<TAB>prompt")
@@ -216,15 +218,12 @@ def save(rows, output_dir):
 def main():
     ns = args()
     rows = read_prompts(ns)
-    b1, b2 = local_dir(ns.b1, "--b1"), local_dir(ns.b2, "--b2")
+    b1 = local_dir(ns.b1, "--b1")
     device = torch.device("cuda" if ns.device == "auto" and torch.cuda.is_available() else ns.device if ns.device != "auto" else "cpu")
     print(f"Device: {device}; prompts: {len(rows)}")
-    tok1, tok2 = load_tokenizer(b1), load_tokenizer(b2)
+    tok1 = load_tokenizer(b1)
     batches = tokenize(tok1, rows, ns.max_length, ns.batch_size)
-    batches2 = tokenize(tok2, rows, ns.max_length, ns.batch_size)
-    for a, b in zip(batches, batches2):
-        if not torch.equal(a["input_ids"], b["input_ids"]) or not torch.equal(a["attention_mask"], b["attention_mask"]):
-            raise RuntimeError("B1 and B2 tokenizers produce different IDs; use a shared tokenizer or aligned token IDs.")
+    del tok1
     token_groups = []
     for batch_index, batch in enumerate(batches):
         for row_index, (group, _) in enumerate(rows[batch_index * ns.batch_size : (batch_index + 1) * ns.batch_size]):
@@ -232,26 +231,42 @@ def main():
     if len(token_groups) > ns.max_hidden_tokens:
         keep = np.linspace(0, len(token_groups) - 1, ns.max_hidden_tokens, dtype=np.int64)
         token_groups = [token_groups[i] for i in keep]
-    del tok1, tok2, batches2
-    print("Loading B1...")
-    m1 = load_model(b1, device, ns.trust_remote_code, ns.max_hidden_tokens); h1 = collect(m1, batches, device)
-    del m1; gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
-    print("Loading B2...")
-    m2 = load_model(b2, device, ns.trust_remote_code, ns.max_hidden_tokens); h2 = collect(m2, batches, device)
-    del m2; gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
-    # token_groups follows the unpadded token order used by collect().
-    all_rows = compare_pair("B1_vs_B2", h1, h2, token_groups, ns.bootstrap, ns.max_cka_tokens)
+
+    def collect_local(label, path):
+        print(f"Loading {label}...")
+        model = load_model(path, device, ns.trust_remote_code, ns.max_hidden_tokens)
+        hidden = collect(model, batches, device)
+        del model
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return hidden
+
+    # Every watermark variant is compared to the same base model on identical token IDs.
+    base_hidden = collect_local("B1/base", b1)
+    watermark_specs = [("k1", ns.b2), ("k0", ns.k0), ("k2", ns.k2)]
+    all_rows = []
+    for k, value in watermark_specs:
+        if value:
+            watermark = local_dir(value, f"--{k if k != 'k1' else 'b2'}")
+            watermark_tokenizer = load_tokenizer(watermark)
+            watermark_batches = tokenize(watermark_tokenizer, rows, ns.max_length, ns.batch_size)
+            for base_batch, watermark_batch in zip(batches, watermark_batches):
+                if not torch.equal(base_batch["input_ids"], watermark_batch["input_ids"]) or not torch.equal(base_batch["attention_mask"], watermark_batch["attention_mask"]):
+                    raise RuntimeError(f"B1 and {k} tokenizers produce different IDs; use a shared tokenizer or aligned token IDs.")
+            del watermark_tokenizer, watermark_batches
+            hidden = collect_local(f"watermark {k}", watermark)
+            all_rows.extend(compare_pair(f"B1_vs_{k}", base_hidden, hidden, token_groups, ns.bootstrap, ns.max_cka_tokens))
+            del hidden
+
     if ns.a1 and ns.a2:
         a1, a2 = local_dir(ns.a1, "--a1"), local_dir(ns.a2, "--a2")
-        print("Loading optional A1/A2 teacher pair...")
-        ma1 = load_model(a1, device, ns.trust_remote_code, ns.max_hidden_tokens)
-        ha1 = collect(ma1, batches, device)
-        del ma1; gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
-        ma2 = load_model(a2, device, ns.trust_remote_code, ns.max_hidden_tokens)
-        ha2 = collect(ma2, batches, device)
-        del ma2; gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
-        # Teacher activations are collected sequentially; compare them after both runs.
-        all_rows.extend(compare_pair("A1_vs_A2", ha1, ha2, token_groups, ns.bootstrap, ns.max_cka_tokens))
+        teacher_base = collect_local("A1 teacher", a1)
+        teacher_watermark = collect_local("A2 teacher", a2)
+        all_rows.extend(compare_pair("A1_vs_A2", teacher_base, teacher_watermark, token_groups, ns.bootstrap, ns.max_cka_tokens))
+        del teacher_base, teacher_watermark
+    if not all_rows:
+        raise RuntimeError("No comparison pair was configured")
     csv_path, plot_path = save(all_rows, Path(ns.output_dir))
     print(f"Saved metrics: {csv_path}\nSaved plot: {plot_path}")
 
