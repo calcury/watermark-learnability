@@ -2,7 +2,8 @@
 pretrained/
 
 # Analysis outputs
-analysis/diff_output/
+analysis/diff_output*/
+analysis/paired_diff_output*/
 
 # Python
 __pycache__/
