@@ -26,6 +26,10 @@ def parse_args():
     p.add_argument("--top-k", type=int, default=20, help="Rows per direction and prompt in the token table")
     p.add_argument("--heatmap-tokens", type=int, default=100, help="Most shifted tokens shown in heatmap")
     p.add_argument("--bins", type=int, default=80)
+    p.add_argument("--prompt-index", type=int, default=None,
+                   help="Analyze only one prompt, using its zero-based index (for example --prompt-index 2)")
+    p.add_argument("--normalization", choices=["center", "zscore"], default="zscore",
+                   help="Normalize each prompt's delta distribution before the distribution plot")
     return p.parse_args()
 
 
@@ -86,7 +90,16 @@ def build_tables(output_dir, delta, prompts, top_k, tokenizer):
     return summary, rows
 
 
-def make_plots(output_dir, delta, prompts, heatmap_tokens, bins, top_k):
+def normalize_delta(delta, method):
+    """Normalize each prompt independently across its vocabulary dimension."""
+    centered = delta - delta.mean(axis=1, keepdims=True)
+    if method == "center":
+        return centered
+    scale = centered.std(axis=1, keepdims=True)
+    return centered / np.maximum(scale, 1e-12)
+
+
+def make_plots(output_dir, delta, prompts, heatmap_tokens, bins, top_k, normalization):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -94,16 +107,19 @@ def make_plots(output_dir, delta, prompts, heatmap_tokens, bins, top_k):
     n_prompts = delta.shape[0]
     labels = [f"p{i}" for i in range(n_prompts)]
 
-    # Distribution of all vocabulary shifts for each prompt.
+    # Distribution of all vocabulary shifts for each prompt. We remove the
+    # per-prompt global offset, then optionally divide by its standard deviation.
+    normalized = normalize_delta(delta, normalization)
+    np.save(output_dir / f"delta_{normalization}.npy", normalized)
     fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-    for i, row in enumerate(delta):
+    for i, row in enumerate(normalized):
         axes[0].hist(row, bins=bins, alpha=.45, density=True, label=labels[i])
     axes[0].axvline(0, color="black", linewidth=1)
-    axes[0].set(title="Distribution of vocabulary logit shifts", xlabel="delta logit", ylabel="density")
+    axes[0].set(title=f"{normalization.title()} vocabulary logit shifts", xlabel=f"{normalization} delta logit", ylabel="density")
     axes[0].legend()
-    axes[1].boxplot(delta.T, labels=labels, showfliers=False)
+    axes[1].boxplot(normalized.T, labels=labels, showfliers=False)
     axes[1].axhline(0, color="black", linewidth=1)
-    axes[1].set(title="Shift distribution by prompt", xlabel="prompt", ylabel="delta logit")
+    axes[1].set(title=f"{normalization.title()} shift by prompt", xlabel="prompt", ylabel=f"{normalization} delta logit")
     fig.tight_layout(); fig.savefig(output_dir / "shift_distributions.png", dpi=180); plt.close(fig)
 
     # Show the globally largest absolute shifts, preserving prompt rows.
@@ -147,6 +163,12 @@ def make_plots(output_dir, delta, prompts, heatmap_tokens, bins, top_k):
 def main():
     ns = parse_args()
     output_dir, delta, prompts, metadata = load_data(ns.input_dir)
+    if ns.prompt_index is not None:
+        if not 0 <= ns.prompt_index < delta.shape[0]:
+            raise ValueError(f"--prompt-index must be between 0 and {delta.shape[0] - 1}")
+        delta = delta[ns.prompt_index:ns.prompt_index + 1]
+        prompts = [prompts[ns.prompt_index]]
+        print(f"Filtering to p{ns.prompt_index}: {prompts[0]}")
     tokenizer = None
     try:
         from transformers import AutoTokenizer
@@ -157,7 +179,7 @@ def main():
         print(f"Tokenizer unavailable; token IDs will still be reported ({exc})")
 
     summary, _ = build_tables(output_dir, delta, prompts, ns.top_k, tokenizer)
-    make_plots(output_dir, delta, prompts, ns.heatmap_tokens, ns.bins, ns.top_k)
+    make_plots(output_dir, delta, prompts, ns.heatmap_tokens, ns.bins, ns.top_k, ns.normalization)
     print(f"Loaded delta matrix: {delta.shape}")
     print("\nPer-prompt summary:")
     print(f"{'prompt':>8} {'RMS':>10} {'mean':>10} {'p01':>10} {'p99':>10} {'max+':>10} {'min-':>10}")
