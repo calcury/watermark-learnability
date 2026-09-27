@@ -188,23 +188,30 @@ def make_plots(out_dir, delta, masks, results):
     fig.savefig(out_dir / "delta_logits_histogram.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-    # Optional pooled view is separate, so it cannot overwrite the prompt panels.
-    pooled_delta = delta.reshape(-1)
-    pooled_green = np.concatenate([values[mask] for values, mask in zip(delta, masks)])
-    pooled_red = np.concatenate([values[~mask] for values, mask in zip(delta, masks)])
-    pooled_edges = np.histogram_bin_edges(pooled_delta, bins=120)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.hist(pooled_delta, bins=pooled_edges, density=True, color="#7a8793", alpha=.38,
-            label="All vocabulary tokens")
-    ax.hist(pooled_green, bins=pooled_edges, density=True, histtype="step", linewidth=1.8,
-            color="#238b45", label="KGW green-list")
-    ax.hist(pooled_red, bins=pooled_edges, density=True, histtype="step", linewidth=1.8,
-            color="#cb3c33", label="KGW red-list")
-    ax.set(title="Pooled logit-difference distribution (prompts mixed)",
-           xlabel="delta logit (model B - model A)", ylabel="density")
-    ax.legend()
+    # Weighted view: each class density is scaled by its KGW prior fraction,
+    # so green + red areas sum to gamma + (1 - gamma) = 1 per prompt.
+    gamma = float(results[0]["gamma_configured"]) if results else 0.25
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4.5 * nrows), squeeze=False)
+    for i, (values, green, result) in enumerate(zip(delta, masks, results)):
+        ax = axes.flat[i]
+        edges = np.histogram_bin_edges(values, bins=120)
+        green_density, _ = np.histogram(values[green], bins=edges, density=True)
+        red_density, _ = np.histogram(values[~green], bins=edges, density=True)
+        ax.hist(values, bins=edges, density=True, color="#aab2bb", alpha=.25,
+                label="All vocabulary tokens (area=1)")
+        ax.stairs(gamma * green_density, edges, color="#238b45", linewidth=1.8,
+                  label=f"KGW green × {gamma:.2f}")
+        ax.stairs((1 - gamma) * red_density, edges, color="#cb3c33", linewidth=1.8,
+                  label=f"KGW red × {1 - gamma:.2f}")
+        ax.set(title=(f"Prompt {i}: weighted green+red area=1, "
+                     f"configured gamma={gamma:.2f}"),
+               xlabel="delta logit (model B - model A), uncentered", ylabel="weighted density")
+        ax.legend(fontsize=8)
+    for i in range(n_prompts, nrows * ncols):
+        axes.flat[i].set_visible(False)
+    fig.suptitle("KGW-weighted logit-difference distributions per prompt", y=1.01)
     fig.tight_layout()
-    fig.savefig(out_dir / "delta_logits_histogram_pooled.png", dpi=180)
+    fig.savefig(out_dir / "delta_logits_histogram_weighted.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -253,8 +260,8 @@ def main():
     print(f"Saved green masks: {out_dir / 'kgw_green_masks.npy'}")
     print(f"Saved alignment table: {out_dir / 'kgw_alignment.csv'}")
     print(f"Saved plots: {out_dir / 'kgw_alignment.png'}, {out_dir / 'kgw_mask_cosine.png'}, "
-          f"{out_dir / 'delta_logits_histogram.png'} (per prompt), "
-          f"{out_dir / 'delta_logits_histogram_pooled.png'} (pooled)")
+          f"{out_dir / 'delta_logits_histogram.png'} (original per-prompt), "
+          f"{out_dir / 'delta_logits_histogram_weighted.png'} (gamma-weighted per-prompt)")
     print(f"{'p':>4} {'cosine':>10} {'green mean':>12} {'red mean':>12} {'gap':>10} {'bias':>10} {'gap-bias':>10}")
     for row in rows:
         print(f"p{row['prompt_index']:>3} {row['centered_mask_delta_cosine']:10.5f} "
