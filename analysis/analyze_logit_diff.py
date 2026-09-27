@@ -6,10 +6,11 @@ Colab example::
     !python analysis/analyze_logit_diff.py \
         --input-dir analysis/llama_logit_diff_output
 
-The script makes no model/network calls. It loads the full matrix
-``delta = watermarked_logits - base_logits`` and writes tables plus figures:
+The script loads the full matrix ``delta = watermarked_logits - base_logits``
+and reproduces the KGW green/red mask for each final prompt context. It writes
 per-prompt summary, token-level extrema, distributions, a prompt-by-token
-heatmap, and overlap of the tokens most positively shifted across prompts.
+heatmap, and KGW tests: centered mask/delta cosine and the green-minus-red
+mean shift compared with the configured KGW bias.
 """
 
 import argparse
@@ -30,6 +31,12 @@ def parse_args():
                    help="Analyze only one prompt, using its zero-based index (for example --prompt-index 2)")
     p.add_argument("--normalization", choices=["none", "center", "zscore"], default="none",
                    help="Optional per-prompt transform before plotting (default: keep raw delta logits)")
+    p.add_argument("--gamma", type=float, default=0.25, help="KGW green-list fraction")
+    p.add_argument("--bias", type=float, default=2.0, help="KGW bias delta used for comparison")
+    p.add_argument("--seeding-scheme", default="simple_1", help="KGW seeding scheme, usually simple_1")
+    p.add_argument("--hf-token", default=None, help="Optional Hugging Face token for loading a gated tokenizer")
+    p.add_argument("--max-length", type=int, default=256,
+                   help="Must match --max-length used when producing delta_logits.npz")
     return p.parse_args()
 
 
@@ -88,6 +95,56 @@ def build_tables(output_dir, delta, prompts, top_k, tokenizer):
     write_csv(output_dir / "token_shift_table.csv", rows)
     write_csv(output_dir / "prompt_summary.csv", summary)
     return summary, rows
+
+
+def kgw_masks(input_ids, vocab_size, gamma, seeding_scheme, tokenizer=None):
+    """Reproduce KGW green masks for the final next-token position of each prompt."""
+    import torch
+    from watermarks.kgw.watermark_processor import WatermarkBase
+
+    if not 0 < gamma < 1:
+        raise ValueError("--gamma must be between 0 and 1")
+    wm = WatermarkBase(vocab=list(range(vocab_size)), gamma=gamma,
+                       seeding_scheme=seeding_scheme, device="cpu")
+    if tokenizer is not None and seeding_scheme == "simple_1":
+        # Match KGWWatermark's special-token exclusion where possible.
+        special_ids = {x for x in (tokenizer.eos_token_id, tokenizer.bos_token_id,
+                                    tokenizer.pad_token_id, tokenizer.unk_token_id)
+                       if x is not None and 0 <= x < vocab_size}
+    else:
+        special_ids = set()
+    masks = []
+    for ids in input_ids:
+        context = ids.detach().cpu().long()
+        if context.numel() < wm.context_width:
+            raise ValueError(f"Prompt has fewer than {wm.context_width} tokens required by {seeding_scheme}")
+        green = wm._get_greenlist_ids(context)
+        mask = np.zeros(vocab_size, dtype=bool)
+        mask[green.numpy()] = True
+        mask[list(special_ids)] = False
+        masks.append(mask)
+    return np.asarray(masks, dtype=bool)
+
+
+def mask_statistics(delta, masks, prompts, bias):
+    rows = []
+    for i, (row, green) in enumerate(zip(delta, masks)):
+        red = ~green
+        centered_delta = row - row.mean()
+        centered_mask = green.astype(np.float64) - green.mean()
+        denominator = np.linalg.norm(centered_delta) * np.linalg.norm(centered_mask)
+        cosine = float(np.dot(centered_delta, centered_mask) / denominator) if denominator else float("nan")
+        green_mean = float(row[green].mean()) if green.any() else float("nan")
+        red_mean = float(row[red].mean()) if red.any() else float("nan")
+        rows.append({"prompt_index": i, "prompt": prompts[i], "green_tokens": int(green.sum()),
+                     "red_tokens": int(red.sum()), "green_fraction": float(green.mean()),
+                     "green_mean_delta": green_mean, "red_mean_delta": red_mean,
+                     "green_minus_red": green_mean - red_mean,
+                     "kgw_bias": float(bias), "gap_minus_bias": green_mean - red_mean - bias,
+                     "centered_mask_delta_cosine": cosine,
+                     "centered_delta_mean": float(centered_delta.mean()),
+                     "centered_delta_std": float(centered_delta.std())})
+    return rows
 
 
 def normalize_delta(delta, method):
@@ -165,22 +222,44 @@ def make_plots(output_dir, delta, prompts, heatmap_tokens, bins, top_k, normaliz
 def main():
     ns = parse_args()
     output_dir, delta, prompts, metadata = load_data(ns.input_dir)
+    original_indices = list(range(delta.shape[0]))
     if ns.prompt_index is not None:
         if not 0 <= ns.prompt_index < delta.shape[0]:
             raise ValueError(f"--prompt-index must be between 0 and {delta.shape[0] - 1}")
         delta = delta[ns.prompt_index:ns.prompt_index + 1]
         prompts = [prompts[ns.prompt_index]]
+        original_indices = [ns.prompt_index]
         print(f"Filtering to p{ns.prompt_index}: {prompts[0]}")
     tokenizer = None
     try:
         from transformers import AutoTokenizer
         source = metadata.get("base")
         if source:
-            tokenizer = AutoTokenizer.from_pretrained(source, token=None, use_fast=True, local_files_only=Path(source).is_dir())
+            tokenizer = AutoTokenizer.from_pretrained(
+                source, token=ns.hf_token, use_fast=True,
+                local_files_only=Path(source).is_dir())
     except Exception as exc:
         print(f"Tokenizer unavailable; token IDs will still be reported ({exc})")
 
+    if tokenizer is None:
+        raise RuntimeError("A tokenizer is required for KGW mask analysis; pass --hf-token or use a local base model")
+
     summary, _ = build_tables(output_dir, delta, prompts, ns.top_k, tokenizer)
+    # Re-tokenize the same prompts with the base tokenizer and reproduce the KGW
+    # green list for the final context used to obtain each delta vector.
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True,
+                        max_length=ns.max_length)
+    final_ids = []
+    for row_ids, row_mask in zip(encoded["input_ids"], encoded["attention_mask"]):
+        final_ids.append(row_ids[row_mask.bool()])
+    masks = kgw_masks(final_ids, delta.shape[1], ns.gamma, ns.seeding_scheme, tokenizer)
+    mask_rows = mask_statistics(delta, masks, prompts, ns.bias)
+    write_csv(output_dir / "kgw_mask_analysis.csv", mask_rows)
+    print("\nKGW mask analysis:")
+    print(f"{'prompt':>8} {'green_mean':>12} {'red_mean':>12} {'gap':>10} {'bias':>10} {'cosine':>10}")
+    for row in mask_rows:
+        print(f"p{row['prompt_index']:>6} {row['green_mean_delta']:12.5f} {row['red_mean_delta']:12.5f} "
+              f"{row['green_minus_red']:10.5f} {row['kgw_bias']:10.5f} {row['centered_mask_delta_cosine']:10.5f}")
     make_plots(output_dir, delta, prompts, ns.heatmap_tokens, ns.bins, ns.top_k, ns.normalization)
     print(f"Loaded delta matrix: {delta.shape}")
     print("\nPer-prompt summary:")
