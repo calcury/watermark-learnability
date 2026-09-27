@@ -22,8 +22,9 @@ DEFAULT_K1 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta
 DEFAULT_K2 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta2"
 DEFAULT_BASE = "EleutherAI/pythia-1.4b"
 
-# Formats we never need for PyTorch inference; skipping them saves disk space.
-IGNORE_PATTERNS = ["*.msgpack", "*.h5", "*.ot", "*.onnx", "*.tflite", "*.flax"]
+# Formats we never need for PyTorch inference; prefer safetensors to avoid
+# downloading the duplicate pytorch_model.bin when both are published.
+IGNORE_PATTERNS = ["*.msgpack", "*.h5", "*.ot", "*.onnx", "*.tflite", "*.flax", "pytorch_model*.bin"]
 
 
 def parse_args():
@@ -64,9 +65,27 @@ def verify(model_dir: Path) -> str:
     """Check the essentials exist and describe the weight files found."""
     if not (model_dir / "config.json").is_file():
         raise RuntimeError(f"{model_dir} has no config.json; the download was incomplete")
-    weights = sorted(p.name for pattern in ("*.safetensors", "*.bin") for p in model_dir.glob(pattern))
-    if not weights:
-        raise RuntimeError(f"{model_dir} has no weight files (*.safetensors/*.bin)")
+    # Verify every checkpoint shard when an index is present.
+    index_files = [model_dir / "model.safetensors.index.json",
+                   model_dir / "pytorch_model.bin.index.json"]
+    indexes = [path for path in index_files if path.is_file()]
+    if indexes:
+        index = indexes[0]
+        try:
+            import json
+            weight_map = json.loads(index.read_text(encoding="utf-8")).get("weight_map", {})
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Invalid checkpoint index {index}: {exc}") from exc
+        weights = sorted(set(weight_map.values()))
+        if not weights:
+            raise RuntimeError(f"{index} has no weight_map entries")
+        missing = [name for name in weights if not (model_dir / name).is_file()]
+        if missing:
+            raise RuntimeError(f"{model_dir} is missing checkpoint shard(s): {', '.join(missing)}")
+    else:
+        weights = sorted(p.name for pattern in ("*.safetensors", "*.bin") for p in model_dir.glob(pattern))
+        if not weights:
+            raise RuntimeError(f"{model_dir} has no weight files (*.safetensors/*.bin)")
     tokenizer_files = [name for name in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model") if (model_dir / name).is_file()]
     if not tokenizer_files:
         raise RuntimeError(f"{model_dir} has no tokenizer files")

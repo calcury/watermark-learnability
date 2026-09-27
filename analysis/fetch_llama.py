@@ -61,9 +61,27 @@ def download(repo_id: str, target: Path, token: str) -> Path:
 def verify(model_dir: Path) -> str:
     if not (model_dir / "config.json").is_file():
         raise RuntimeError(f"{model_dir} has no config.json; the download was incomplete")
-    weights = sorted(p.name for pattern in ("*.safetensors", "*.bin") for p in model_dir.glob(pattern))
-    if not weights:
-        raise RuntimeError(f"{model_dir} has no weight files (*.safetensors/*.bin)")
+    # Verify every checkpoint shard when an index is present.
+    index_files = [model_dir / "model.safetensors.index.json",
+                   model_dir / "pytorch_model.bin.index.json"]
+    indexes = [path for path in index_files if path.is_file()]
+    if indexes:
+        index = indexes[0]
+        try:
+            import json
+            weight_map = json.loads(index.read_text(encoding="utf-8")).get("weight_map", {})
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Invalid checkpoint index {index}: {exc}") from exc
+        weights = sorted(set(weight_map.values()))
+        if not weights:
+            raise RuntimeError(f"{index} has no weight_map entries")
+        missing = [name for name in weights if not (model_dir / name).is_file()]
+        if missing:
+            raise RuntimeError(f"{model_dir} is missing checkpoint shard(s): {', '.join(missing)}")
+    else:
+        weights = sorted(p.name for pattern in ("*.safetensors", "*.bin") for p in model_dir.glob(pattern))
+        if not weights:
+            raise RuntimeError(f"{model_dir} has no weight files (*.safetensors/*.bin)")
     tokenizer_files = [name for name in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model") if (model_dir / name).is_file()]
     if not tokenizer_files:
         raise RuntimeError(f"{model_dir} has no tokenizer files")

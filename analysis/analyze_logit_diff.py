@@ -61,6 +61,8 @@ def parse_args():
                         help="KGW scheme; auto maps k0/k1/k2 to simple_0/simple_1/simple_2")
     parser.add_argument("--output-dir", help="Output directory (default: analysis/result/<family>_<a>_vs_<b>)")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--offload-folder", default="analysis/offload",
+                        help="Directory for temporary CPU/disk-offloaded model weights")
     parser.add_argument("--hf-token", help="Hugging Face token; otherwise use HF_TOKEN or prompt for Llama")
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser.parse_args()
@@ -82,12 +84,16 @@ def load_tokenizer(source, token, trust_remote_code):
     return tokenizer
 
 
-def load_model(source, token, device, trust_remote_code):
+def load_model(source, token, device, trust_remote_code, offload_folder):
     from transformers import AutoModelForCausalLM
     kwargs = {"token": token, "low_cpu_mem_usage": True,
               "trust_remote_code": trust_remote_code}
     if device.type == "cuda":
-        kwargs.update(torch_dtype=torch.float16, device_map="auto")
+        # device_map=auto may spill layers to disk when GPU/CPU RAM is limited.
+        model_offload_dir = Path(offload_folder) / Path(source).name
+        model_offload_dir.mkdir(parents=True, exist_ok=True)
+        kwargs.update(torch_dtype=torch.float16, device_map="auto",
+                      offload_folder=str(model_offload_dir))
     else:
         kwargs["torch_dtype"] = torch.float32
     model = AutoModelForCausalLM.from_pretrained(source, **kwargs)
@@ -126,8 +132,7 @@ def collect_logits(model, batches):
     return torch.cat(outputs).numpy()
 
 
-def release_model(model, device):
-    del model
+def release_model(device):
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -167,14 +172,16 @@ def main():
     check_tokenization(batches_a, batches_b)
 
     print(f"Collecting {args.model_a} logits...")
-    model = load_model(source_a, token, device, args.trust_remote_code)
+    model = load_model(source_a, token, device, args.trust_remote_code, args.offload_folder)
     logits_a = collect_logits(model, batches_a)
-    release_model(model, device)
+    del model
+    release_model(device)
 
     print(f"Collecting {args.model_b} logits...")
-    model = load_model(source_b, token, device, args.trust_remote_code)
+    model = load_model(source_b, token, device, args.trust_remote_code, args.offload_folder)
     logits_b = collect_logits(model, batches_a)
-    release_model(model, device)
+    del model
+    release_model(device)
 
     kgw_scheme = args.kgw_seeding_scheme
     if kgw_scheme == "auto":
