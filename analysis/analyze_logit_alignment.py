@@ -252,7 +252,9 @@ def main():
     print(f"KGW settings: gamma={gamma}, bias={bias}, seeding_scheme={seeding_scheme}")
     print(f"Saved green masks: {out_dir / 'kgw_green_masks.npy'}")
     print(f"Saved alignment table: {out_dir / 'kgw_alignment.csv'}")
-    print(f"Saved plots: {out_dir / 'kgw_alignment.png'}, {out_dir / 'kgw_mask_cosine.png'}, {out_dir / 'delta_logits_histogram.png'}")
+    print(f"Saved plots: {out_dir / 'kgw_alignment.png'}, {out_dir / 'kgw_mask_cosine.png'}, "
+          f"{out_dir / 'delta_logits_histogram.png'} (per prompt), "
+          f"{out_dir / 'delta_logits_histogram_pooled.png'} (pooled)")
     print(f"{'p':>4} {'cosine':>10} {'green mean':>12} {'red mean':>12} {'gap':>10} {'bias':>10} {'gap-bias':>10}")
     for row in rows:
         print(f"p{row['prompt_index']:>3} {row['centered_mask_delta_cosine']:10.5f} "
