@@ -1,24 +1,21 @@
 #!/usr/bin/env python
-"""Export same-context logit differences between two causal language models.
+"""Export next-token logits for a chosen model-family / variant pair.
 
-This script intentionally performs no plots or statistical analysis. It only
-loads two models, computes next-token logits for identical token IDs, and
-saves NumPy arrays under ``analysis/result/``.
+Choose a model family (``llama`` or ``pythia``) and two variants
+(``base``, ``k0``, ``k1``, ``k2``). Model IDs and local cache paths mirror
+``analysis/fetch_llama.py`` and ``analysis/fetch_pythia.py``.
 
-Colab example::
+Examples::
 
-    !python analysis/analyze_logit_diff.py --hf-token
+    !python analysis/analyze_logit_diff.py llama base k0
+    !python analysis/analyze_logit_diff.py pythia base k2
 
-    # Compare arbitrary local directories or Hugging Face repositories:
-    !python analysis/analyze_logit_diff.py \
-        --base meta-llama/Llama-2-7b-hf \
-        --watermarked cygu/llama-2-7b-logit-watermark-distill-kgw-k0-gamma0.25-delta2 \
-        --hf-token
+For gated Llama access, set ``HF_TOKEN`` or enter it when prompted.
 """
 
 import argparse
-import gc
 import getpass
+import gc
 import json
 import os
 from pathlib import Path
@@ -26,8 +23,20 @@ from pathlib import Path
 import numpy as np
 import torch
 
-DEFAULT_BASE = "meta-llama/Llama-2-7b-hf"
-DEFAULT_WATERMARKED = "cygu/llama-2-7b-logit-watermark-distill-kgw-k0-gamma0.25-delta2"
+MODEL_REPOS = {
+    "llama": {
+        "base": "meta-llama/Llama-2-7b-hf",
+        "k0": "cygu/llama-2-7b-logit-watermark-distill-kgw-k0-gamma0.25-delta2",
+        "k1": "cygu/llama-2-7b-logit-watermark-distill-kgw-k1-gamma0.25-delta2",
+        "k2": "cygu/llama-2-7b-logit-watermark-distill-kgw-k2-gamma0.25-delta2",
+    },
+    "pythia": {
+        "base": "EleutherAI/pythia-1.4b",
+        "k0": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta2",
+        "k1": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta2",
+        "k2": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta2",
+    },
+}
 DEFAULT_PROMPTS = [
     "Explain why the seasons change on Earth in a short paragraph.",
     "A careful scientist records uncertainty instead of hiding it.",
@@ -37,49 +46,31 @@ DEFAULT_PROMPTS = [
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--base", default=DEFAULT_BASE, help="Clean/base model repository or local directory")
-    p.add_argument("--watermarked", default=DEFAULT_WATERMARKED, help="Second model repository or local directory")
-    p.add_argument("--prompt", dest="prompts", action="append", help="Input text; repeat for multiple prompts")
-    p.add_argument("--prompt-file", help="UTF-8 file containing one input text per line")
-    p.add_argument("--max-length", type=int, default=256)
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--output-dir", default="analysis/result")
-    p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    p.add_argument("--hf-token", nargs="?", const="__PROMPT__", default=None,
-                   help="Token value, or pass without value to enter it securely")
-    p.add_argument("--trust-remote-code", action="store_true")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("family", choices=MODEL_REPOS, help="Model family: llama or pythia")
+    parser.add_argument("model_a", choices=("base", "k0", "k1", "k2"))
+    parser.add_argument("model_b", choices=("base", "k0", "k1", "k2"))
+    parser.add_argument("--prompt", dest="prompts", action="append", help="Input text; repeat to compare multiple prompts")
+    parser.add_argument("--prompt-file", help="UTF-8 file with one input text per line")
+    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--output-dir", help="Output directory (default: analysis/result/<family>_<a>_vs_<b>)")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--hf-token", help="Hugging Face token; otherwise use HF_TOKEN or prompt for Llama")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    return parser.parse_args()
 
 
-def read_prompts(ns):
-    if ns.prompts:
-        prompts = ns.prompts
-    elif ns.prompt_file:
-        with open(ns.prompt_file, encoding="utf-8") as f:
-            prompts = [line.rstrip("\n") for line in f if line.strip()]
-    else:
-        prompts = DEFAULT_PROMPTS
-    if not prompts:
-        raise ValueError("No prompts were supplied")
-    return prompts
-
-
-def get_token(value):
-    if value == "__PROMPT__":
-        return getpass.getpass("Hugging Face access token (input hidden): ")
-    token = value or os.environ.get("HF_TOKEN")
-    if not token:
-        token = getpass.getpass("Hugging Face access token (input hidden): ")
-    if not token:
-        raise ValueError("A Hugging Face token is required")
-    return token
+def resolve_model(family, variant):
+    repo = MODEL_REPOS[family][variant]
+    local = Path("pretrained") / repo.rsplit("/", 1)[-1]
+    return str(local) if (local / "config.json").is_file() else repo
 
 
 def load_tokenizer(source, token, trust_remote_code):
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        source, token=token, use_fast=True, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(source, token=token, use_fast=True,
+                                              trust_remote_code=trust_remote_code)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -101,39 +92,36 @@ def load_model(source, token, device, trust_remote_code):
     return model
 
 
-def model_input_device(model):
-    return model.get_input_embeddings().weight.device
-
-
-def tokenize(tokenizer, prompts, max_length, batch_size):
+def encode(tokenizer, prompts, max_length, batch_size):
     return [tokenizer(prompts[i:i + batch_size], return_tensors="pt", padding=True,
                       truncation=True, max_length=max_length)
             for i in range(0, len(prompts), batch_size)]
 
 
-def check_same_inputs(base_batches, other_batches):
-    if len(base_batches) != len(other_batches):
-        raise RuntimeError("The two tokenizers produced different batch counts")
-    for i, (base, other) in enumerate(zip(base_batches, other_batches)):
+def check_tokenization(batches_a, batches_b):
+    if len(batches_a) != len(batches_b):
+        raise ValueError("The selected models produced different tokenizer batch counts")
+    for batch_idx, (a, b) in enumerate(zip(batches_a, batches_b)):
         for key in ("input_ids", "attention_mask"):
-            if not torch.equal(base[key], other[key]):
-                raise RuntimeError(f"Tokenizers differ in batch {i} ({key})")
+            if not torch.equal(a[key], b[key]):
+                raise ValueError(f"Tokenizers differ in batch {batch_idx} ({key}); same-context comparison is invalid")
 
 
-def next_token_logits(model, batches):
-    device = model_input_device(model)
+def collect_logits(model, batches):
+    input_device = model.get_input_embeddings().weight.device
     outputs = []
     with torch.inference_mode():
-        for encoded in batches:
-            inputs = {key: value.to(device) for key, value in encoded.items()}
+        for batch in batches:
+            inputs = {key: value.to(input_device) for key, value in batch.items()}
             result = model(**inputs, use_cache=False, return_dict=True)
             last = inputs["attention_mask"].sum(dim=1).long() - 1
-            rows = torch.arange(last.shape[0], device=device)
-            outputs.append(result.logits[rows, last].float().cpu())
+            row_ids = torch.arange(last.shape[0], device=input_device)
+            outputs.append(result.logits[row_ids, last].float().cpu())
+            del result, inputs
     return torch.cat(outputs).numpy()
 
 
-def clear_model(model, device):
+def release_model(model, device):
     del model
     gc.collect()
     if device.type == "cuda":
@@ -141,53 +129,64 @@ def clear_model(model, device):
 
 
 def main():
-    ns = parse_args()
-    prompts = read_prompts(ns)
-    token = get_token(ns.hf_token)
-    device = torch.device("cuda" if ns.device == "auto" and torch.cuda.is_available()
-                          else "cpu" if ns.device == "auto" else ns.device)
+    args = parse_args()
+    if args.prompts:
+        prompts = args.prompts
+    elif args.prompt_file:
+        with open(args.prompt_file, encoding="utf-8") as file:
+            prompts = [line.rstrip("\n") for line in file if line.strip()]
+    else:
+        prompts = DEFAULT_PROMPTS
+    if not prompts:
+        raise ValueError("No input prompts found")
+
+    token = args.hf_token or os.environ.get("HF_TOKEN")
+    if args.family == "llama" and not token:
+        token = getpass.getpass("Llama-2 Hugging Face access token (input hidden): ")
+        if not token:
+            raise ValueError("A Hugging Face token with Llama-2 access is required")
+
+    source_a = resolve_model(args.family, args.model_a)
+    source_b = resolve_model(args.family, args.model_b)
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
+                          else "cpu" if args.device == "auto" else args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
-    base_tokenizer = load_tokenizer(ns.base, token, ns.trust_remote_code)
-    other_tokenizer = load_tokenizer(ns.watermarked, token, ns.trust_remote_code)
-    base_batches = tokenize(base_tokenizer, prompts, ns.max_length, ns.batch_size)
-    other_batches = tokenize(other_tokenizer, prompts, ns.max_length, ns.batch_size)
-    check_same_inputs(base_batches, other_batches)
+    print(f"Family: {args.family}; comparison: {args.model_a} vs {args.model_b}; device: {device}")
+    print(f"Model A: {source_a}\nModel B: {source_b}")
+    tokenizer_a = load_tokenizer(source_a, token, args.trust_remote_code)
+    tokenizer_b = load_tokenizer(source_b, token, args.trust_remote_code)
+    batches_a = encode(tokenizer_a, prompts, args.max_length, args.batch_size)
+    batches_b = encode(tokenizer_b, prompts, args.max_length, args.batch_size)
+    check_tokenization(batches_a, batches_b)
 
-    print(f"Device: {device}; prompts: {len(prompts)}")
-    print(f"Base: {ns.base}")
-    print(f"Other: {ns.watermarked}")
+    print(f"Collecting {args.model_a} logits...")
+    model = load_model(source_a, token, device, args.trust_remote_code)
+    logits_a = collect_logits(model, batches_a)
+    release_model(model, device)
 
-    print("Collecting base logits...")
-    base_model = load_model(ns.base, token, device, ns.trust_remote_code)
-    base_logits = next_token_logits(base_model, base_batches)
-    clear_model(base_model, device)
+    print(f"Collecting {args.model_b} logits...")
+    model = load_model(source_b, token, device, args.trust_remote_code)
+    logits_b = collect_logits(model, batches_a)
+    release_model(model, device)
 
-    print("Collecting other-model logits...")
-    other_model = load_model(ns.watermarked, token, device, ns.trust_remote_code)
-    other_logits = next_token_logits(other_model, base_batches)
-    clear_model(other_model, device)
-
-    output_dir = Path(ns.output_dir)
+    output_dir = Path(args.output_dir or
+                      f"analysis/result/{args.family}_{args.model_a}_vs_{args.model_b}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    delta = other_logits - base_logits
-    np.save(output_dir / "base_logits.npy", base_logits)
-    np.save(output_dir / "other_logits.npy", other_logits)
+    delta = logits_b - logits_a
+    np.save(output_dir / "logits_a.npy", logits_a)
+    np.save(output_dir / "logits_b.npy", logits_b)
     np.save(output_dir / "delta_logits.npy", delta)
-    metadata = {
-        "base": ns.base,
-        "other": ns.watermarked,
-        "prompts": prompts,
-        "max_length": ns.max_length,
-        "definition": "delta_logits = other_logits - base_logits",
-        "position": "last non-padding token; next-token logits",
-        "shape": list(delta.shape),
-    }
+    metadata = {"family": args.family, "model_a_variant": args.model_a,
+                "model_b_variant": args.model_b, "model_a": source_a, "model_b": source_b,
+                "prompts": prompts, "max_length": args.max_length,
+                "definition": "delta_logits = logits_b - logits_a",
+                "position": "last non-padding token; next-token logits",
+                "shape": list(delta.shape)}
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Saved NumPy data to {output_dir.resolve()}")
-    print(f"delta_logits shape: {delta.shape}")
+    print(f"Saved arrays to {output_dir.resolve()} (delta shape: {delta.shape})")
 
 
 if __name__ == "__main__":
