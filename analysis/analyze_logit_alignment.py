@@ -100,6 +100,10 @@ def analyze(delta, masks, prompts, gamma, bias):
         gap = green_mean - red_mean
         results.append({
             "prompt_index": i, "prompt": prompts[i],
+            "delta_mean_raw": float(values.mean()),
+            "delta_std_raw": float(values.std()),
+            "delta_min_raw": float(values.min()),
+            "delta_max_raw": float(values.max()),
             "green_count": int(green.sum()), "red_count": int(red.sum()),
             "green_fraction_actual": float(green.mean()), "gamma_configured": gamma,
             "green_mean_delta": green_mean, "red_mean_delta": red_mean,
@@ -152,24 +156,55 @@ def make_plots(out_dir, delta, masks, results):
     fig.savefig(out_dir / "kgw_mask_cosine.png", dpi=180)
     plt.close(fig)
 
-    # Pooled vocabulary-wise delta-logit distribution. Overlay green/red
-    # components using identical bins to make a possible two-peak pattern clear.
+    # Do not pool prompts in the primary plot: their raw means may differ.
+    # Each prompt gets independent bins so its within-prompt structure remains visible.
+    n_prompts = len(delta)
+    ncols = min(2, n_prompts)
+    nrows = (n_prompts + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4.5 * nrows), squeeze=False)
+    for i, (values, green, result) in enumerate(zip(delta, masks, results)):
+        ax = axes.flat[i]
+        edges = np.histogram_bin_edges(values, bins=120)
+        ax.hist(values, bins=edges, density=True, color="#aab2bb", alpha=.35,
+                label="All vocabulary tokens")
+        ax.hist(values[green], bins=edges, density=True, histtype="step", linewidth=1.8,
+                color="#238b45", label="KGW green")
+        ax.hist(values[~green], bins=edges, density=True, histtype="step", linewidth=1.8,
+                color="#cb3c33", label="KGW red")
+        ax.axvline(float(values.mean()), color="#424b54", linestyle="--", linewidth=1,
+                   label=f"raw mean={values.mean():.3g}")
+        ax.axvline(float(values[green].mean()), color="#238b45", linestyle=":", linewidth=1,
+                   label=f"green mean={values[green].mean():.3g}")
+        ax.axvline(float(values[~green].mean()), color="#cb3c33", linestyle=":", linewidth=1,
+                   label=f"red mean={values[~green].mean():.3g}")
+        ax.set(title=(f"Prompt {i}: green-red={result['green_minus_red_delta']:.3g}, "
+                     f"cos={result['centered_mask_delta_cosine']:.3g}"),
+               xlabel="delta logit (model B - model A), uncentered", ylabel="density")
+        ax.legend(fontsize=8)
+    for i in range(n_prompts, nrows * ncols):
+        axes.flat[i].set_visible(False)
+    fig.suptitle("Logit-difference distribution per prompt (raw, uncentered)", y=1.01)
+    fig.tight_layout()
+    fig.savefig(out_dir / "delta_logits_histogram.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    # Optional pooled view is separate, so it cannot overwrite the prompt panels.
     pooled_delta = delta.reshape(-1)
     pooled_green = np.concatenate([values[mask] for values, mask in zip(delta, masks)])
     pooled_red = np.concatenate([values[~mask] for values, mask in zip(delta, masks)])
-    edges = np.histogram_bin_edges(pooled_delta, bins=120)
+    pooled_edges = np.histogram_bin_edges(pooled_delta, bins=120)
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.hist(pooled_delta, bins=edges, density=True, color="#7a8793", alpha=.38,
+    ax.hist(pooled_delta, bins=pooled_edges, density=True, color="#7a8793", alpha=.38,
             label="All vocabulary tokens")
-    ax.hist(pooled_green, bins=edges, density=True, histtype="step", linewidth=1.8,
+    ax.hist(pooled_green, bins=pooled_edges, density=True, histtype="step", linewidth=1.8,
             color="#238b45", label="KGW green-list")
-    ax.hist(pooled_red, bins=edges, density=True, histtype="step", linewidth=1.8,
+    ax.hist(pooled_red, bins=pooled_edges, density=True, histtype="step", linewidth=1.8,
             color="#cb3c33", label="KGW red-list")
-    ax.set(title="Distribution of logit differences (all prompts)",
+    ax.set(title="Pooled logit-difference distribution (prompts mixed)",
            xlabel="delta logit (model B - model A)", ylabel="density")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "delta_logits_histogram.png", dpi=180)
+    fig.savefig(out_dir / "delta_logits_histogram_pooled.png", dpi=180)
     plt.close(fig)
 
 
