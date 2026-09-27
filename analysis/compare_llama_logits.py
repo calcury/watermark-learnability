@@ -205,7 +205,7 @@ def main():
                 "vocab_size": int(base_logits.shape[1]), "device": str(device)}
     delta = write_results(prompts, base_logits, wm_logits, base_tok, Path(ns.output_dir), ns.top_k, metadata)
     print(f"Saved full delta vectors with shape {delta.shape} to {ns.output_dir}/delta_logits.npz")
-    print(f"Mean RMS shift: {np.sqrt(np.mean(delta ** 2), axis=1).mean():.6f}")
+    print(f"Mean RMS shift: {np.sqrt(np.mean(delta ** 2, axis=1)).mean():.6f}")
 
 
 if __name__ == "__main__":
