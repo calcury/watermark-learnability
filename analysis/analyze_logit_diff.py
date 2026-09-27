@@ -54,6 +54,11 @@ def parse_args():
     parser.add_argument("--prompt-file", help="UTF-8 file with one input text per line")
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--kgw-gamma", type=float, default=0.25, help="KGW green-list fraction used by the selected model")
+    parser.add_argument("--kgw-bias", type=float, default=2.0, help="KGW logit bias used by the selected model")
+    parser.add_argument("--kgw-seeding-scheme", default="auto",
+                        choices=("auto", "simple_0", "simple_1", "simple_2"),
+                        help="KGW scheme; auto maps k0/k1/k2 to simple_0/simple_1/simple_2")
     parser.add_argument("--output-dir", help="Output directory (default: analysis/result/<family>_<a>_vs_<b>)")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--hf-token", help="Hugging Face token; otherwise use HF_TOKEN or prompt for Llama")
@@ -171,6 +176,11 @@ def main():
     logits_b = collect_logits(model, batches_a)
     release_model(model, device)
 
+    kgw_scheme = args.kgw_seeding_scheme
+    if kgw_scheme == "auto":
+        watermark_variant = args.model_b if args.model_b != "base" else args.model_a
+        kgw_scheme = {"k0": "simple_0", "k1": "simple_1", "k2": "simple_2"}.get(watermark_variant, "simple_1")
+
     output_dir = Path(args.output_dir or
                       f"analysis/result/{args.family}_{args.model_a}_vs_{args.model_b}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -178,11 +188,30 @@ def main():
     np.save(output_dir / "logits_a.npy", logits_a)
     np.save(output_dir / "logits_b.npy", logits_b)
     np.save(output_dir / "delta_logits.npy", delta)
+    # Exact final context IDs are needed to reproduce KGW's context-seeded mask.
+    # Batches can have different padded widths, so repad all rows to one width.
+    max_width = max(batch["input_ids"].shape[1] for batch in batches_a)
+    token_ids = np.full((len(prompts), max_width), tokenizer_a.pad_token_id, dtype=np.int64)
+    attention_mask = np.zeros((len(prompts), max_width), dtype=np.int64)
+    row_offset = 0
+    for batch in batches_a:
+        batch_ids = batch["input_ids"].numpy()
+        batch_mask = batch["attention_mask"].numpy()
+        width = batch_ids.shape[1]
+        batch_rows = batch_ids.shape[0]
+        token_ids[row_offset:row_offset + batch_rows, :width] = batch_ids
+        attention_mask[row_offset:row_offset + batch_rows, :width] = batch_mask
+        row_offset += batch_rows
+    np.save(output_dir / "input_ids.npy", token_ids)
+    np.save(output_dir / "attention_mask.npy", attention_mask)
     metadata = {"family": args.family, "model_a_variant": args.model_a,
                 "model_b_variant": args.model_b, "model_a": source_a, "model_b": source_b,
                 "prompts": prompts, "max_length": args.max_length,
+                "kgw_gamma": args.kgw_gamma, "kgw_bias": args.kgw_bias,
+                "kgw_seeding_scheme": kgw_scheme,
                 "definition": "delta_logits = logits_b - logits_a",
                 "position": "last non-padding token; next-token logits",
+                "mask_context": "full tokenized prompt; KGW greenlist seeded by final context token(s)",
                 "shape": list(delta.shape)}
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
