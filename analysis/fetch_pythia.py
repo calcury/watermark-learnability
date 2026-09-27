@@ -4,9 +4,11 @@
 Colab usage (run from the repository root)::
 
     !pip install -q -U transformers huggingface_hub
-    !python analysis/fetch_pythia.py
+    !python analysis/fetch_pythia.py base
+    !python analysis/fetch_pythia.py k0
 
-All repositories are downloaded directly from Hugging Face into
+Pass exactly one model value (``base``, ``k0``, ``k1``, or ``k2``) per
+invocation so that only one model is downloaded at a time. All repositories are downloaded directly from Hugging Face into
 ``pretrained/<model-name>``. Pythia models are public, so no token is required;
 ``--token``/``HF_TOKEN`` is still accepted for rate limits or private mirrors.
 """
@@ -28,6 +30,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--k0", default=DEFAULT_K0, help="k=0 watermark-distilled Pythia repo ID")
     parser.add_argument("--k1", default=DEFAULT_K1, help="k=1 watermark-distilled Pythia repo ID")
+    parser.add_argument("value", choices=("base", "k0", "k1", "k2"), help="Model to download")
     parser.add_argument("--k2", default=DEFAULT_K2, help="k=2 watermark-distilled Pythia repo ID")
     parser.add_argument("--base", default=DEFAULT_BASE, help="Base/original Pythia repo ID")
     parser.add_argument("--output-dir", default="pretrained", help="Directory that receives the model folders")
@@ -74,22 +77,15 @@ def verify(model_dir: Path) -> str:
 def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
-    jobs = [("base", args.base), ("k0", args.k0), ("k1", args.k1), ("k2", args.k2)]
-    folders = [default_local_name(repo_id) for _, repo_id in jobs]
-    if len(set(folders)) != len(folders):
-        raise ValueError("The models would share a folder name; pass distinct repository IDs")
+    repositories = {"base": args.base, "k0": args.k0, "k1": args.k1, "k2": args.k2}
+    label, repo_id = args.value, repositories[args.value]
+    target = output_dir / default_local_name(repo_id)
 
     print(f"Downloading into: {output_dir.resolve()}")
-    results = {}
-    for label, repo_id in jobs:
-        target = output_dir / default_local_name(repo_id)
-        print(f"\n[{label}] {repo_id} -> {target}")
-        path = download(repo_id, target, args.token)
-        print(f"Downloaded: {path}")
-        print(f"[{label}] {verify(path)}")
-        results[label] = path
-
-    print("\nDone. Downloaded base, k0, k1, and k2 Pythia models.")
+    print(f"\n[{label}] {repo_id} -> {target}")
+    path = download(repo_id, target, args.token)
+    print(f"Downloaded: {path}")
+    print(f"[{label}] {verify(path)}")
 
 
 if __name__ == "__main__":
