@@ -28,8 +28,8 @@ def parse_args():
     p.add_argument("--bins", type=int, default=80)
     p.add_argument("--prompt-index", type=int, default=None,
                    help="Analyze only one prompt, using its zero-based index (for example --prompt-index 2)")
-    p.add_argument("--normalization", choices=["center", "zscore"], default="zscore",
-                   help="Normalize each prompt's delta distribution before the distribution plot")
+    p.add_argument("--normalization", choices=["none", "center", "zscore"], default="none",
+                   help="Optional per-prompt transform before plotting (default: keep raw delta logits)")
     return p.parse_args()
 
 
@@ -93,6 +93,8 @@ def build_tables(output_dir, delta, prompts, top_k, tokenizer):
 def normalize_delta(delta, method):
     """Normalize each prompt independently across its vocabulary dimension."""
     centered = delta - delta.mean(axis=1, keepdims=True)
+    if method == "none":
+        return delta
     if method == "center":
         return centered
     scale = centered.std(axis=1, keepdims=True)
