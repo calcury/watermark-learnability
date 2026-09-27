@@ -152,6 +152,26 @@ def make_plots(out_dir, delta, masks, results):
     fig.savefig(out_dir / "kgw_mask_cosine.png", dpi=180)
     plt.close(fig)
 
+    # Pooled vocabulary-wise delta-logit distribution. Overlay green/red
+    # components using identical bins to make a possible two-peak pattern clear.
+    pooled_delta = delta.reshape(-1)
+    pooled_green = np.concatenate([values[mask] for values, mask in zip(delta, masks)])
+    pooled_red = np.concatenate([values[~mask] for values, mask in zip(delta, masks)])
+    edges = np.histogram_bin_edges(pooled_delta, bins=120)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.hist(pooled_delta, bins=edges, density=True, color="#7a8793", alpha=.38,
+            label="All vocabulary tokens")
+    ax.hist(pooled_green, bins=edges, density=True, histtype="step", linewidth=1.8,
+            color="#238b45", label="KGW green-list")
+    ax.hist(pooled_red, bins=edges, density=True, histtype="step", linewidth=1.8,
+            color="#cb3c33", label="KGW red-list")
+    ax.set(title="Distribution of logit differences (all prompts)",
+           xlabel="delta logit (model B - model A)", ylabel="density")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "delta_logits_histogram.png", dpi=180)
+    plt.close(fig)
+
 
 def main():
     args = parse_args()
@@ -197,7 +217,7 @@ def main():
     print(f"KGW settings: gamma={gamma}, bias={bias}, seeding_scheme={seeding_scheme}")
     print(f"Saved green masks: {out_dir / 'kgw_green_masks.npy'}")
     print(f"Saved alignment table: {out_dir / 'kgw_alignment.csv'}")
-    print(f"Saved plots: {out_dir / 'kgw_alignment.png'}, {out_dir / 'kgw_mask_cosine.png'}")
+    print(f"Saved plots: {out_dir / 'kgw_alignment.png'}, {out_dir / 'kgw_mask_cosine.png'}, {out_dir / 'delta_logits_histogram.png'}")
     print(f"{'p':>4} {'cosine':>10} {'green mean':>12} {'red mean':>12} {'gap':>10} {'bias':>10} {'gap-bias':>10}")
     for row in rows:
         print(f"p{row['prompt_index']:>3} {row['centered_mask_delta_cosine']:10.5f} "
