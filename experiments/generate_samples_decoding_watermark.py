@@ -45,6 +45,8 @@ parser.add_argument("--output_file", type=str, required=True)
 parser.add_argument("--overwrite_output_file", action="store_true", default=False)
 parser.add_argument("--fp16", action="store_true", default=False)
 parser.add_argument("--watermark_configs_file", type=str, required=True)
+parser.add_argument("--delta", type=int, choices=(1, 2), default=2,
+                    help="Select KGW configs with this bias/delta (default: 2); non-KGW configs are kept")
 
 args = parser.parse_args()
 
@@ -175,6 +177,13 @@ full_human_text = prompts_dict["full_human_text"]
 
 with open(args.watermark_configs_file, "r") as f:
     watermark_configs_list = json.load(f)
+if args.delta is not None:
+    watermark_configs_list = [
+        config for config in watermark_configs_list
+        if config.get("type") != WatermarkType.KGW or float(config.get("delta", -1)) == float(args.delta)
+    ]
+    if not watermark_configs_list:
+        raise ValueError(f"No watermark configs match --delta {args.delta}")
 
 prefix_count = 0
 

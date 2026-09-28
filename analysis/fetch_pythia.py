@@ -5,7 +5,8 @@ Colab usage (run from the repository root)::
 
     !pip install -q -U transformers huggingface_hub
     !python analysis/fetch_pythia.py base
-    !python analysis/fetch_pythia.py k0
+    !python analysis/fetch_pythia.py k0              # delta2 default
+    !python analysis/fetch_pythia.py k0 --delta 1
 
 Pass exactly one model value (``base``, ``k0``, ``k1``, or ``k2``) per
 invocation so that only one model is downloaded at a time. All repositories are downloaded directly from Hugging Face into
@@ -17,9 +18,9 @@ import argparse
 import os
 from pathlib import Path
 
-DEFAULT_K0 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta2"
-DEFAULT_K1 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta2"
-DEFAULT_K2 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta2"
+DEFAULT_K0 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta{delta}"
+DEFAULT_K1 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta{delta}"
+DEFAULT_K2 = "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta{delta}"
 DEFAULT_BASE = "EleutherAI/pythia-1.4b"
 
 # Formats we never need for PyTorch inference; prefer safetensors to avoid
@@ -29,10 +30,12 @@ IGNORE_PATTERNS = ["*.msgpack", "*.h5", "*.ot", "*.onnx", "*.tflite", "*.flax", 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--k0", default=DEFAULT_K0, help="k=0 watermark-distilled Pythia repo ID")
-    parser.add_argument("--k1", default=DEFAULT_K1, help="k=1 watermark-distilled Pythia repo ID")
     parser.add_argument("value", choices=("base", "k0", "k1", "k2"), help="Model to download")
-    parser.add_argument("--k2", default=DEFAULT_K2, help="k=2 watermark-distilled Pythia repo ID")
+    parser.add_argument("--delta", type=int, choices=(1, 2), default=2,
+                        help="KGW logit bias/repository delta (default: 2); ignored for base")
+    parser.add_argument("--k0", help="Override k=0 watermark Pythia repo ID")
+    parser.add_argument("--k1", help="Override k=1 watermark Pythia repo ID")
+    parser.add_argument("--k2", help="Override k=2 watermark Pythia repo ID")
     parser.add_argument("--base", default=DEFAULT_BASE, help="Base/original Pythia repo ID")
     parser.add_argument("--output-dir", default="pretrained", help="Directory that receives the model folders")
     parser.add_argument("--token", default=os.environ.get("HF_TOKEN"), help="Optional Hugging Face token, or set HF_TOKEN")
@@ -96,7 +99,14 @@ def verify(model_dir: Path) -> str:
 def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
-    repositories = {"base": args.base, "k0": args.k0, "k1": args.k1, "k2": args.k2}
+    repositories = {
+        "base": args.base,
+        "k0": args.k0 or DEFAULT_K0.format(delta=args.delta),
+        "k1": args.k1 or DEFAULT_K1.format(delta=args.delta),
+        "k2": args.k2 or DEFAULT_K2.format(delta=args.delta),
+    }
+    if args.delta == 1 and args.value == "k2" and args.k2 is None:
+        raise ValueError("No default Pythia k2-delta1 checkpoint is configured; provide --k2 with a valid Hub repo ID.")
     label, repo_id = args.value, repositories[args.value]
     target = output_dir / default_local_name(repo_id)
 

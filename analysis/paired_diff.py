@@ -39,8 +39,10 @@ DEFAULT_PROMPTS = [
 
 def args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--delta", type=int, choices=(1, 2), default=2,
+                   help="KGW bias delta (default: 2); used to resolve default watermark checkpoints")
     p.add_argument("--b1", default=DEFAULT_B1, help="Normal student B1 local directory")
-    p.add_argument("--b2", default=DEFAULT_B2, help="Legacy k=1 watermark student B2 local directory")
+    p.add_argument("--b2", default=None, help="Watermark student B2 local directory (defaults from --delta)")
     p.add_argument("--k0", default=None, help="Optional k=0 watermark student local directory")
     p.add_argument("--k2", default=None, help="Optional k=2 watermark student local directory")
     p.add_argument("--a1", default=None, help="Optional normal teacher A1 local directory")
@@ -218,6 +220,17 @@ def save(rows, output_dir):
 def main():
     ns = args()
     rows = read_prompts(ns)
+    if ns.b2 is None:
+        ns.b2 = f"pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta{ns.delta}"
+    import re
+    for option, checkpoint in (("--b2", ns.b2), ("--k0", ns.k0), ("--k2", ns.k2)):
+        if checkpoint:
+            match = re.search(r"-delta([12])(?:$|[-/\\])", str(checkpoint))
+            if match and int(match.group(1)) != ns.delta:
+                raise ValueError(
+                    f"{option} points to delta{match.group(1)}, but --delta={ns.delta}; "
+                    "use matching checkpoint paths."
+                )
     b1 = local_dir(ns.b1, "--b1")
     device = torch.device("cuda" if ns.device == "auto" and torch.cuda.is_available() else ns.device if ns.device != "auto" else "cpu")
     print(f"Device: {device}; prompts: {len(rows)}")
@@ -244,6 +257,8 @@ def main():
 
     # Every watermark variant is compared to the same base model on identical token IDs.
     base_hidden = collect_local("B1/base", b1)
+    if ns.output_dir == "analysis/paired_diff_output" and ns.delta != 2:
+        ns.output_dir = f"analysis/paired_diff_output_delta{ns.delta}"
     watermark_specs = [("k1", ns.b2), ("k0", ns.k0), ("k2", ns.k2)]
     all_rows = []
     for k, value in watermark_specs:

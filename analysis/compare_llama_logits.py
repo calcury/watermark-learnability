@@ -29,7 +29,7 @@ import numpy as np
 import torch
 
 DEFAULT_BASE = "meta-llama/Llama-2-7b-hf"
-DEFAULT_WATERMARKED = "cygu/llama-2-7b-logit-watermark-distill-kgw-k0-gamma0.25-delta2"
+DEFAULT_WATERMARKED = "cygu/llama-2-7b-logit-watermark-distill-kgw-k{k}-gamma0.25-delta{delta}"
 DEFAULT_PROMPTS = [
     "Explain why the seasons change on Earth in a short paragraph.",
     "A careful scientist records uncertainty instead of hiding it.",
@@ -42,13 +42,17 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base", default=DEFAULT_BASE, help="Clean Llama-2-7B model repo or local directory")
     p.add_argument("--watermarked", default=None, help="Watermarked model repo or local directory (defaults to cygu's k-specific checkpoint)")
-    p.add_argument("--k", type=int, default=0, help="KGW k value used to select the default watermark repo")
+    p.add_argument("--k", type=int, choices=(0, 1, 2), default=0,
+                   help="KGW k value used to select the default watermark repo")
+    p.add_argument("--delta", type=int, choices=(1, 2), default=2,
+                   help="KGW logit bias/repository delta (default: 2)")
     p.add_argument("--hf-token", nargs="?", const="__PROMPT__", default=None,
                    help="Use this token, or pass the flag without a value to enter it securely")
     p.add_argument("--prompt", dest="prompts", action="append", help="Input text x; repeat for multiple prompts")
     p.add_argument("--prompt-file", help="UTF-8 file with one input text per line")
     p.add_argument("--max-length", type=int, default=256)
-    p.add_argument("--output-dir", default="analysis/llama_logit_diff_output")
+    p.add_argument("--output-dir", default=None,
+                   help="Output directory (default: analysis/llama_logit_diff_k{k}_delta{delta})")
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--top-k", type=int, default=100, help="Number of largest positive/negative shifts to write to CSV")
@@ -168,14 +172,26 @@ def write_results(prompts, base_logits, wm_logits, tokenizer, output_dir, top_k,
 def main():
     ns = parse_args()
     prompts = read_prompts(ns)
-    if ns.watermarked is None:
-        ns.watermarked = DEFAULT_WATERMARKED.replace("k0", f"k{ns.k}")
+    is_default_watermarked = ns.watermarked is None
+    if is_default_watermarked:
+        ns.watermarked = DEFAULT_WATERMARKED.format(k=ns.k, delta=ns.delta)
+        effective_delta = ns.delta
+    else:
+        import re
+        match = re.search(r"-delta([12])(?:$|[-/])", str(ns.watermarked))
+        effective_delta = int(match.group(1)) if match else None
+        if effective_delta is not None and effective_delta != ns.delta:
+            raise ValueError(
+                f"--watermarked points to delta{effective_delta}, but --delta={ns.delta}. "
+                "Use matching --delta or omit the custom model path."
+            )
     token = get_token(ns)
     device = torch.device("cuda" if ns.device == "auto" and torch.cuda.is_available() else
                           "cpu" if ns.device == "auto" else ns.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    print(f"Device: {device}; prompts: {len(prompts)}; max length: {ns.max_length}")
+    delta_label = str(effective_delta) if effective_delta is not None else "unknown (custom checkpoint)"
+    print(f"Device: {device}; prompts: {len(prompts)}; max length: {ns.max_length}; KGW delta/bias: {delta_label}")
     print(f"Base: {ns.base}\nWatermarked (k={ns.k}): {ns.watermarked}")
 
     base_tok = load_tokenizer(ns.base, token, ns.trust_remote_code)
@@ -199,12 +215,16 @@ def main():
     del wm_model; gc.collect()
     if device.type == "cuda": torch.cuda.empty_cache()
 
+    output_dir = ns.output_dir or f"analysis/llama_logit_diff_k{ns.k}_delta{effective_delta if effective_delta is not None else 'unknown'}"
     metadata = {"base": ns.base, "watermarked": ns.watermarked, "k": ns.k,
+                "kgw_delta": effective_delta,
+                "kgw_gamma": 0.25 if effective_delta is not None else None,
+                "kgw_bias": float(effective_delta) if effective_delta is not None else None,
                 "prompts": prompts, "definition": "delta = watermarked_logits - base_logits",
                 "logit_position": "last non-padding token (next-token prediction)",
                 "vocab_size": int(base_logits.shape[1]), "device": str(device)}
-    delta = write_results(prompts, base_logits, wm_logits, base_tok, Path(ns.output_dir), ns.top_k, metadata)
-    print(f"Saved full delta vectors with shape {delta.shape} to {ns.output_dir}/delta_logits.npz")
+    delta = write_results(prompts, base_logits, wm_logits, base_tok, Path(output_dir), ns.top_k, metadata)
+    print(f"Saved full delta vectors with shape {delta.shape} to {output_dir}/delta_logits.npz")
     print(f"Mean RMS shift: {np.sqrt(np.mean(delta ** 2, axis=1)).mean():.6f}")
 
 

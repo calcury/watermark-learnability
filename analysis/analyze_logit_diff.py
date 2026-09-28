@@ -23,20 +23,15 @@ from pathlib import Path
 import numpy as np
 import torch
 
-MODEL_REPOS = {
-    "llama": {
-        "base": "meta-llama/Llama-2-7b-hf",
-        "k0": "cygu/llama-2-7b-logit-watermark-distill-kgw-k0-gamma0.25-delta2",
-        "k1": "cygu/llama-2-7b-logit-watermark-distill-kgw-k1-gamma0.25-delta2",
-        "k2": "cygu/llama-2-7b-logit-watermark-distill-kgw-k2-gamma0.25-delta2",
-    },
-    "pythia": {
-        "base": "EleutherAI/pythia-1.4b",
-        "k0": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta2",
-        "k1": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta2",
-        "k2": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta2",
-    },
+BASE_REPOS = {
+    "llama": "meta-llama/Llama-2-7b-hf",
+    "pythia": "EleutherAI/pythia-1.4b",
 }
+WATERMARK_REPO_TEMPLATES = {
+    "llama": "cygu/llama-2-7b-logit-watermark-distill-kgw-{variant}-gamma0.25-delta{delta}",
+    "pythia": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-{variant}-gamma0.25-delta{delta}",
+}
+MODEL_VARIANTS = ("base", "k0", "k1", "k2")
 DEFAULT_PROMPTS = [
     "Explain why the seasons change on Earth in a short paragraph.",
     "A careful scientist records uncertainty instead of hiding it.",
@@ -47,15 +42,18 @@ DEFAULT_PROMPTS = [
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("family", choices=MODEL_REPOS, help="Model family: llama or pythia")
-    parser.add_argument("model_a", choices=("base", "k0", "k1", "k2"))
-    parser.add_argument("model_b", choices=("base", "k0", "k1", "k2"))
+    parser.add_argument("family", choices=BASE_REPOS, help="Model family: llama or pythia")
+    parser.add_argument("model_a", choices=MODEL_VARIANTS)
+    parser.add_argument("model_b", choices=MODEL_VARIANTS)
+    parser.add_argument("--delta", type=int, choices=(1, 2), default=2,
+                        help="KGW delta/bias and watermark repository variant (default: 2)")
     parser.add_argument("--prompt", dest="prompts", action="append", help="Input text; repeat to compare multiple prompts")
     parser.add_argument("--prompt-file", help="UTF-8 file with one input text per line")
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--kgw-gamma", type=float, default=0.25, help="KGW green-list fraction used by the selected model")
-    parser.add_argument("--kgw-bias", type=float, default=2.0, help="KGW logit bias used by the selected model")
+    parser.add_argument("--kgw-bias", type=float, default=None,
+                        help="Override KGW logit bias (default: value selected by --delta)")
     parser.add_argument("--kgw-seeding-scheme", default="auto",
                         choices=("auto", "simple_0", "simple_1", "simple_2"),
                         help="KGW scheme; auto maps k0/k1/k2 to simple_0/simple_1/simple_2")
@@ -68,8 +66,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_model(family, variant):
-    repo = MODEL_REPOS[family][variant]
+def resolve_model(family, variant, delta):
+    if variant == "base":
+        repo = BASE_REPOS[family]
+    else:
+        repo = WATERMARK_REPO_TEMPLATES[family].format(variant=variant, delta=delta)
     local = Path("pretrained") / repo.rsplit("/", 1)[-1]
     return str(local) if (local / "config.json").is_file() else repo
 
@@ -156,14 +157,18 @@ def main():
         if not token:
             raise ValueError("A Hugging Face token with Llama-2 access is required")
 
-    source_a = resolve_model(args.family, args.model_a)
-    source_b = resolve_model(args.family, args.model_b)
+    if args.delta == 1 and "k2" in (args.model_a, args.model_b):
+        raise ValueError("No default k2-delta1 checkpoint is configured; use k0/k1 or add an explicit repository override.")
+    source_a = resolve_model(args.family, args.model_a, args.delta)
+    source_b = resolve_model(args.family, args.model_b, args.delta)
+    kgw_bias = float(args.kgw_bias if args.kgw_bias is not None else args.delta)
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
                           else "cpu" if args.device == "auto" else args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
-    print(f"Family: {args.family}; comparison: {args.model_a} vs {args.model_b}; device: {device}")
+    print(f"Family: {args.family}; comparison: {args.model_a} vs {args.model_b}; "
+          f"KGW delta/bias: {args.delta}/{kgw_bias:g}; device: {device}")
     print(f"Model A: {source_a}\nModel B: {source_b}")
     tokenizer_a = load_tokenizer(source_a, token, args.trust_remote_code)
     tokenizer_b = load_tokenizer(source_b, token, args.trust_remote_code)
@@ -189,7 +194,7 @@ def main():
         kgw_scheme = {"k0": "simple_0", "k1": "simple_1", "k2": "simple_2"}.get(watermark_variant, "simple_1")
 
     output_dir = Path(args.output_dir or
-                      f"analysis/result/{args.family}_{args.model_a}_vs_{args.model_b}")
+                      f"analysis/result/{args.family}_{args.model_a}_vs_{args.model_b}_delta{args.delta}")
     output_dir.mkdir(parents=True, exist_ok=True)
     delta = logits_b - logits_a
     np.save(output_dir / "logits_a.npy", logits_a)
@@ -214,7 +219,8 @@ def main():
     metadata = {"family": args.family, "model_a_variant": args.model_a,
                 "model_b_variant": args.model_b, "model_a": source_a, "model_b": source_b,
                 "prompts": prompts, "max_length": args.max_length,
-                "kgw_gamma": args.kgw_gamma, "kgw_bias": args.kgw_bias,
+                "kgw_delta": args.delta,
+                "kgw_gamma": args.kgw_gamma, "kgw_bias": kgw_bias,
                 "kgw_seeding_scheme": kgw_scheme,
                 "definition": "delta_logits = logits_b - logits_a",
                 "position": "last non-padding token; next-token logits",

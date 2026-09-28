@@ -18,20 +18,35 @@ its base `EleutherAI/pythia-1.4b` is a useful A1/B1 control, but it is **not**
 a complete causal reproduction of all four cells. A true reproduction needs
 training A1/A2 and then distilling each with the same script and seed.
 
-## Colab reproduction
+## Delta selection and Colab reproduction
+
+KGW `delta` is the logit bias. The download, logit comparison, and alignment
+scripts accept `--delta 1` or `--delta 2`; when omitted, they select delta2.
+Watermark checkpoint folder names also include the selected delta so runs do
+not overwrite each other.
 
 ```python
-!pip install -q -U transformers datasets accelerate matplotlib
-!python analysis/fetch_model.py
-# B1 = pretrained/pythia-1.4b; compare k=0, k=1, and k=2 checkpoints
-!python analysis/paired_diff.py \
-  --b1 pretrained/pythia-1.4b \
-  --b2 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta2 \
-  --k0 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta2 \
-  --k2 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta2 \
-  --prompt-file data/probe.tsv \
+!python analysis/fetch_pythia.py k0 --delta 1
+!python analysis/fetch_pythia.py k0                  # defaults to delta2
+!python analysis/analyze_logit_diff.py pythia base k0 --delta 1
+!python analysis/analyze_logit_alignment.py --delta 1
+```
+
+For the representation comparison, pass checkpoints matching the same delta.
+Example delta2 run (the default):
+
+```python
+!python analysis/paired_diff.py \\
+  --delta 2 \\
+  --b1 pretrained/pythia-1.4b \\
+  --b2 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k1-gamma0.25-delta2 \\
+  --k0 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta2 \\
+  --k2 pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k2-gamma0.25-delta2 \\
+  --prompt-file data/probe.tsv \\
   --output-dir analysis/paired_diff_output
 ```
+For delta1, use the corresponding `...-delta1` checkpoint paths; the default
+output directory becomes `analysis/paired_diff_output_delta1`.
 
 `data/probe.tsv` can be either one prompt per line or `group<TAB>prompt`.
 Pre-register groups such as `clean`, `trigger`, and `random`; do not select a

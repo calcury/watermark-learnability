@@ -31,10 +31,12 @@ import torch
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input_dir", nargs="?", default="analysis/result/llama_base_vs_k0",
+    parser.add_argument("input_dir", nargs="?", default=None,
                         help="Directory containing delta_logits.npy, input_ids.npy, metadata.json")
     parser.add_argument("--gamma", type=float, default=None, help="Override KGW gamma; otherwise read metadata")
-    parser.add_argument("--bias", type=float, default=None, help="Override KGW bias delta; otherwise read metadata")
+    parser.add_argument("--bias", type=float, default=None, help="Override KGW bias; otherwise read metadata (or --delta)")
+    parser.add_argument("--delta", type=int, choices=(1, 2), default=None,
+                        help="Expected KGW delta (checks metadata); supplies the bias only when metadata lacks it")
     parser.add_argument("--seeding-scheme", default=None, help="Override KGW seeding scheme; otherwise read metadata")
     parser.add_argument("--hf-token", default=None, help="Optional token if model tokenizer must be fetched")
     return parser.parse_args()
@@ -122,6 +124,80 @@ def save_csv(path, rows):
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def save_token_level_csv(path, delta, masks, gamma, logits_a=None, logits_b=None, prompts=None):
+    """Write one auditable row per prompt and vocabulary token."""
+    fields = ["prompt_index", "prompt", "token_id", "kgw_class", "is_green",
+              "logits_a", "logits_b", "delta_logit", "delta_centered",
+              "centered_mask_value"]
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for prompt_index, (values, green) in enumerate(zip(delta, masks)):
+            centered = values - values.mean()
+            prompt = prompts[prompt_index] if prompts and prompt_index < len(prompts) else f"prompt_{prompt_index}"
+            for token_id, (value, is_green) in enumerate(zip(values, green)):
+                writer.writerow({
+                    "prompt_index": prompt_index, "prompt": prompt, "token_id": token_id,
+                    "kgw_class": "green" if is_green else "red", "is_green": int(is_green),
+                    "logits_a": "" if logits_a is None else float(logits_a[prompt_index, token_id]),
+                    "logits_b": "" if logits_b is None else float(logits_b[prompt_index, token_id]),
+                    "delta_logit": float(value), "delta_centered": float(centered[token_id]),
+                    "centered_mask_value": (1.0 - gamma) if is_green else -gamma,
+                })
+
+
+def save_summary_json(path, metadata, rows, delta, masks, gamma, bias, seeding_scheme):
+    """Save auditable run settings and descriptive aggregates without token-independence claims."""
+    green_values = [values[mask] for values, mask in zip(delta, masks)]
+    red_values = [values[~mask] for values, mask in zip(delta, masks)]
+    pooled_green = np.concatenate(green_values)
+    pooled_red = np.concatenate(red_values)
+    metric_names = ("centered_mask_delta_cosine", "green_minus_red_delta",
+                    "gap_minus_bias", "delta_mean_raw", "delta_std_raw")
+    aggregates = {}
+    for name in metric_names:
+        values = np.asarray([row[name] for row in rows], dtype=np.float64)
+        aggregates[name] = {
+            "mean_across_prompts": float(np.mean(values)),
+            "median_across_prompts": float(np.median(values)),
+            "std_across_prompts_population": float(np.std(values)),
+            "min_across_prompts": float(np.min(values)),
+            "max_across_prompts": float(np.max(values)),
+        }
+    summary = {
+        "experiment": {
+            "family": metadata.get("family"),
+            "model_a_variant": metadata.get("model_a_variant"),
+            "model_b_variant": metadata.get("model_b_variant"),
+            "model_a": metadata.get("model_a"), "model_b": metadata.get("model_b"),
+            "delta_definition": metadata.get("definition", "logits_b - logits_a"),
+            "logit_position": metadata.get("position"),
+            "kgw_gamma": gamma, "kgw_bias": bias, "kgw_seeding_scheme": seeding_scheme,
+            "prompt_count": int(delta.shape[0]), "vocab_size": int(delta.shape[1]),
+            "prompts": metadata.get("prompts", []),
+        },
+        "pooled_descriptive_metrics": {
+            "green_count": int(sum(mask.sum() for mask in masks)),
+            "red_count": int(sum((~mask).sum() for mask in masks)),
+            "green_fraction_actual": float(np.mean(masks)),
+            "green_mean_delta": float(pooled_green.mean()),
+            "red_mean_delta": float(pooled_red.mean()),
+            "green_minus_red_delta": float(pooled_green.mean() - pooled_red.mean()),
+            "configured_bias": float(bias),
+            "gap_minus_bias": float(pooled_green.mean() - pooled_red.mean() - bias),
+            "delta_mean_raw_all_prompt_tokens": float(delta.mean()),
+            "delta_std_raw_all_prompt_tokens": float(delta.std()),
+        },
+        "across_prompt_descriptives": aggregates,
+        "per_prompt_metrics": rows,
+        "interpretation_note": (
+            "Across-prompt values are descriptive for this probe set. Vocabulary entries are not treated as independent samples;"
+            " no inferential p-values are reported. A positive centered cosine indicates directional alignment."
+        ),
+    }
+    path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def make_plots(out_dir, delta, masks, results):
@@ -217,6 +293,13 @@ def make_plots(out_dir, delta, masks, results):
 
 def main():
     args = parse_args()
+    if args.input_dir is None:
+        delta_tag = f"_delta{args.delta}" if args.delta is not None else "_delta2"
+        default_dir = Path(f"analysis/result/llama_base_vs_k0{delta_tag}")
+        legacy_delta2_dir = Path("analysis/result/llama_base_vs_k0")
+        if args.delta is None and not default_dir.exists() and legacy_delta2_dir.exists():
+            default_dir = legacy_delta2_dir
+        args.input_dir = str(default_dir)
     out_dir = Path(args.input_dir)
     required = ("delta_logits.npy", "input_ids.npy", "attention_mask.npy", "metadata.json")
     missing = [name for name in required if not (out_dir / name).is_file()]
@@ -233,15 +316,66 @@ def main():
     if delta.shape[0] != input_ids.shape[0] or delta.shape[1] != int(metadata.get("shape", delta.shape)[-1]):
         raise ValueError("Saved logits and input context arrays do not align")
 
+    logits_a_path, logits_b_path = out_dir / "logits_a.npy", out_dir / "logits_b.npy"
+    logits_a = np.load(logits_a_path, allow_pickle=False) if logits_a_path.is_file() else None
+    logits_b = np.load(logits_b_path, allow_pickle=False) if logits_b_path.is_file() else None
+    if (logits_a is None) != (logits_b is None):
+        raise ValueError("Both logits_a.npy and logits_b.npy must be present together")
+    if logits_a is not None:
+        if logits_a.shape != delta.shape or logits_b.shape != delta.shape:
+            raise ValueError("Saved model logits do not match delta_logits shape")
+        if not np.allclose(logits_b.astype(np.float64) - logits_a.astype(np.float64), delta, rtol=1e-5, atol=1e-6):
+            raise ValueError("delta_logits.npy does not match logits_b.npy - logits_a.npy")
+
+    metadata_delta = metadata.get("kgw_delta")
+    if metadata_delta is None:
+        import re
+        model_ref = str(metadata.get("model_b", ""))
+        match = re.search(r"-delta([12])(?:$|[-/])", model_ref)
+        metadata_delta = int(match.group(1)) if match else None
+    if args.delta is not None and metadata_delta is not None and int(metadata_delta) != args.delta:
+        raise ValueError(f"Requested --delta {args.delta}, but result metadata indicates delta{metadata_delta}")
     gamma = args.gamma if args.gamma is not None else float(metadata.get("kgw_gamma", .25))
-    bias = args.bias if args.bias is not None else float(metadata.get("kgw_bias", 2.0))
+    default_bias = float(args.delta if args.delta is not None else (metadata_delta or 2))
+    if args.bias is not None:
+        bias = float(args.bias)
+    elif args.delta is not None:
+        bias = float(args.delta)
+    else:
+        bias = float(metadata.get("kgw_bias", default_bias))
     seeding_scheme = args.seeding_scheme or metadata.get("kgw_seeding_scheme", "simple_1")
-    tokenizer = load_tokenizer(metadata, args.hf_token)
-    masks = build_green_masks(input_ids, attention_mask, delta.shape[1],
-                              gamma, seeding_scheme, tokenizer)
+    mask_path = out_dir / "kgw_green_masks.npy"
+    mask_metadata_path = out_dir / "kgw_green_masks_metadata.json"
+    expected_mask_metadata = {"kgw_gamma": gamma, "kgw_seeding_scheme": seeding_scheme,
+                              "shape": list(delta.shape), "mask_context": metadata.get("mask_context")}
+    reuse_mask = False
+    if mask_path.is_file():
+        saved_mask_metadata = None
+        if mask_metadata_path.is_file():
+            saved_mask_metadata = read_metadata(mask_metadata_path)
+        else:
+            # Legacy masks were generated with the run-level settings; only
+            # trust them when no analysis-time override changes those settings.
+            run_gamma = float(metadata.get("kgw_gamma", .25))
+            run_scheme = metadata.get("kgw_seeding_scheme", "simple_1")
+            if gamma == run_gamma and seeding_scheme == run_scheme:
+                saved_mask_metadata = expected_mask_metadata
+        reuse_mask = saved_mask_metadata == expected_mask_metadata
+        if reuse_mask:
+            masks = np.load(mask_path, allow_pickle=False).astype(bool)
+            if masks.shape != delta.shape:
+                raise ValueError(f"Saved KGW mask shape {masks.shape} does not match logits {delta.shape}")
+            print(f"Reusing KGW mask verified for gamma={gamma}, scheme={seeding_scheme}: {mask_path}")
+    if not reuse_mask:
+        tokenizer = load_tokenizer(metadata, args.hf_token)
+        masks = build_green_masks(input_ids, attention_mask, delta.shape[1],
+                                  gamma, seeding_scheme, tokenizer)
+    mask_metadata_path.write_text(json.dumps(expected_mask_metadata, indent=2), encoding="utf-8")
     prompts = metadata.get("prompts", [f"prompt_{i}" for i in range(delta.shape[0])])
+    if len(prompts) != delta.shape[0]:
+        raise ValueError("Prompt count in metadata does not match saved logits")
     rows = analyze(delta, masks, prompts, gamma, bias)
-    np.save(out_dir / "kgw_green_masks.npy", masks.astype(np.uint8))
+    np.save(mask_path, masks.astype(np.uint8))
     np.savez_compressed(
         out_dir / "kgw_metrics.npz",
         centered_mask_delta_cosine=np.asarray([r["centered_mask_delta_cosine"] for r in rows]),
@@ -252,16 +386,28 @@ def main():
         gap_minus_bias=np.asarray([r["gap_minus_bias"] for r in rows]),
         green_counts=np.asarray([r["green_count"] for r in rows]),
         red_counts=np.asarray([r["red_count"] for r in rows]),
+        green_fraction_actual=np.asarray([r["green_fraction_actual"] for r in rows]),
+        delta_mean_raw=np.asarray([r["delta_mean_raw"] for r in rows]),
+        delta_std_raw=np.asarray([r["delta_std_raw"] for r in rows]),
+        delta_min_raw=np.asarray([r["delta_min_raw"] for r in rows]),
+        delta_max_raw=np.asarray([r["delta_max_raw"] for r in rows]),
     )
     save_csv(out_dir / "kgw_alignment.csv", rows)
+    save_token_level_csv(out_dir / "kgw_token_level.csv", delta, masks, gamma,
+                         logits_a=logits_a, logits_b=logits_b, prompts=prompts)
+    save_summary_json(out_dir / "kgw_summary.json", metadata, rows, delta, masks,
+                      gamma, bias, seeding_scheme)
     make_plots(out_dir, delta, masks, rows)
+    obsolete_pooled_plot = out_dir / "delta_logits_histogram_pooled.png"
+    if obsolete_pooled_plot.is_file():
+        obsolete_pooled_plot.unlink()
 
     print(f"KGW settings: gamma={gamma}, bias={bias}, seeding_scheme={seeding_scheme}")
-    print(f"Saved green masks: {out_dir / 'kgw_green_masks.npy'}")
-    print(f"Saved alignment table: {out_dir / 'kgw_alignment.csv'}")
+    print(f"Saved prompt metrics: {out_dir / 'kgw_alignment.csv'}")
+    print(f"Saved token-level data: {out_dir / 'kgw_token_level.csv'}")
+    print(f"Saved experiment summary: {out_dir / 'kgw_summary.json'}")
     print(f"Saved plots: {out_dir / 'kgw_alignment.png'}, {out_dir / 'kgw_mask_cosine.png'}, "
-          f"{out_dir / 'delta_logits_histogram.png'} (original per-prompt), "
-          f"{out_dir / 'delta_logits_histogram_weighted.png'} (gamma-weighted per-prompt)")
+          f"{out_dir / 'delta_logits_histogram.png'}, {out_dir / 'delta_logits_histogram_weighted.png'}")
     print(f"{'p':>4} {'cosine':>10} {'green mean':>12} {'red mean':>12} {'gap':>10} {'bias':>10} {'gap-bias':>10}")
     for row in rows:
         print(f"p{row['prompt_index']:>3} {row['centered_mask_delta_cosine']:10.5f} "
