@@ -24,7 +24,13 @@ import gc
 import getpass
 import json
 import os
+import sys
 from pathlib import Path
+
+# Allow running this file from any working directory (including Colab paths).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import torch
