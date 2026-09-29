@@ -1,8 +1,9 @@
 #!/usr/bin/env python
-"""Compare every hidden-state layer in model A against every layer in model B.
+"""Compare same-numbered hidden-state layers in model A and model B.
 
-For each layer pair, reports mean paired-token cosine similarity (when hidden
-sizes match) and linear CKA. Writes the full layer-pair table and heatmaps.
+For layer ``i``, compares A[i] directly with B[i] using mean paired-token
+cosine similarity and linear CKA. This is intended to locate which model
+depths are most affected by watermark distillation.
 
 Examples::
 
@@ -171,9 +172,14 @@ def linear_cka_from_grams(gram_x, gram_y):
     return float(np.sum(gram_x * gram_y) / denominator) if denominator > 0 else float("nan")
 
 
-def compare_all_layer_pairs(states_a, states_b, max_tokens):
-    sample_count = min(min(state.shape[0] for state in states_a),
-                       min(state.shape[0] for state in states_b))
+def compare_same_layers(states_a, states_b, max_tokens):
+    """Compare A[i] only with B[i], preserving the physical model depth."""
+    if len(states_a) != len(states_b):
+        raise ValueError(
+            f"Models expose different hidden-state counts ({len(states_a)} vs {len(states_b)}); "
+            "same-layer comparison requires matching architectures."
+        )
+    sample_count = states_a[0].shape[0]
     if sample_count == 0:
         raise ValueError("No valid (non-padding) token representations were collected")
     if any(state.shape[0] != sample_count for state in states_a + states_b):
@@ -182,37 +188,33 @@ def compare_all_layer_pairs(states_a, states_b, max_tokens):
         indices = np.linspace(0, sample_count - 1, max_tokens, dtype=np.int64)
         states_a = [state[indices] for state in states_a]
         states_b = [state[indices] for state in states_b]
-    gram_a = [centered_sample_gram(state) for state in states_a]
-    gram_b = [centered_sample_gram(state) for state in states_b]
     rows = []
-    cosine_matrix = np.full((len(states_a), len(states_b)), np.nan)
-    cka_matrix = np.full_like(cosine_matrix, np.nan)
-    for layer_a, x in enumerate(states_a):
-        for layer_b, y in enumerate(states_b):
-            if x.shape[0] != y.shape[0]:
-                raise ValueError(f"Unaligned token samples at layers A{layer_a}, B{layer_b}")
-            cosine = paired_cosine_similarity(x, y)
-            cka = linear_cka_from_grams(gram_a[layer_a], gram_b[layer_b])
-            cosine_matrix[layer_a, layer_b] = np.nan if cosine is None else cosine
-            cka_matrix[layer_a, layer_b] = cka
-            rows.append({
-                "layer_a": layer_a, "layer_b": layer_b,
-                "cosine_similarity": "" if cosine is None else cosine,
-                "linear_cka": cka,
-                "tokens": int(x.shape[0]),
-                "hidden_size_a": int(x.shape[1]), "hidden_size_b": int(y.shape[1]),
-            })
-    return rows, cosine_matrix, cka_matrix, int(states_a[0].shape[0])
+    cosine_values = []
+    cka_values = []
+    for layer, (x, y) in enumerate(zip(states_a, states_b)):
+        cosine = paired_cosine_similarity(x, y)
+        cka = linear_cka_from_grams(centered_sample_gram(x), centered_sample_gram(y))
+        cosine_values.append(np.nan if cosine is None else cosine)
+        cka_values.append(cka)
+        rows.append({
+            "layer": layer,
+            "cosine_similarity": "" if cosine is None else cosine,
+            "linear_cka": cka,
+            "tokens": int(x.shape[0]),
+            "hidden_size_a": int(x.shape[1]), "hidden_size_b": int(y.shape[1]),
+        })
+    return rows, np.asarray(cosine_values), np.asarray(cka_values), int(states_a[0].shape[0])
 
 
 def save_outputs(rows, cosine, cka, out_dir, metadata):
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / "cross_layer_metrics.csv"
+    csv_path = out_dir / "same_layer_metrics.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    np.savez_compressed(out_dir / "cross_layer_matrices.npz",
+    np.savez_compressed(out_dir / "same_layer_metrics.npz",
+                        layer=np.asarray([row["layer"] for row in rows]),
                         cosine_similarity=cosine, linear_cka=cka)
     (out_dir / "experiment_config.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -220,25 +222,24 @@ def save_outputs(rows, cosine, cka, out_dir, metadata):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 2, figsize=(max(12, cosine.shape[1] * .55),
-                                           max(5, cosine.shape[0] * .42)))
-    for ax, matrix, title, cmap, vmin, vmax in (
-        (axes[0], cosine, "Paired-token cosine similarity", "coolwarm", -1, 1),
-        (axes[1], cka, "Linear CKA", "viridis", 0, 1),
-    ):
-        image = ax.imshow(matrix, aspect="auto", origin="lower", cmap=cmap,
-                          vmin=vmin, vmax=vmax, interpolation="nearest")
-        ax.set_title(title)
-        ax.set_xlabel("Model B hidden-state layer")
-        ax.set_ylabel("Model A hidden-state layer")
-        ax.set_xticks(range(matrix.shape[1]))
-        ax.set_yticks(range(matrix.shape[0]))
-        fig.colorbar(image, ax=ax, fraction=.046, pad=.04)
+    layers = np.arange(len(rows))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    axes[0].plot(layers, cosine, marker="o", color="#2563eb", linewidth=1.8)
+    axes[0].set_title("Same-layer paired-token cosine similarity")
+    axes[0].set_ylabel("Cosine similarity (higher = closer)")
+    axes[1].plot(layers, cka, marker="o", color="#15803d", linewidth=1.8)
+    axes[1].set_title("Same-layer linear CKA")
+    axes[1].set_ylabel("CKA (higher = more similar)")
+    for ax in axes:
+        ax.set_xlabel("Matching hidden-state layer (0 = embeddings)")
+        ax.set_xticks(layers)
+        ax.grid(alpha=.25)
+    fig.suptitle("Model A vs B: same-depth representation comparison")
     fig.tight_layout()
-    plot_path = out_dir / "cross_layer_heatmaps.png"
+    plot_path = out_dir / "same_layer_metrics.png"
     fig.savefig(plot_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
-    return csv_path, out_dir / "cross_layer_matrices.npz", plot_path
+    return csv_path, out_dir / "same_layer_metrics.npz", plot_path
 
 
 def main():
@@ -274,7 +275,7 @@ def main():
     states_b, info_b = load_hidden_states(source_b, batches_a, token, device, args.trust_remote_code)
     if info_a["hidden_size"] != info_b["hidden_size"]:
         print("Note: hidden sizes differ; cosine is left blank for incompatible layer pairs, but CKA remains available.")
-    rows, cosine_matrix, cka_matrix, used_tokens = compare_all_layer_pairs(
+    rows, cosine_values, cka_values, used_tokens = compare_same_layers(
         states_a, states_b, args.max_tokens)
     safe_a = re.sub(r"[^A-Za-z0-9._-]+", "_", args.model_a.rsplit("/", 1)[-1])
     safe_b = re.sub(r"[^A-Za-z0-9._-]+", "_", args.model_b.rsplit("/", 1)[-1])
@@ -285,18 +286,19 @@ def main():
         "model_a": info_a, "model_b": info_b,
         "prompts": prompts, "max_length": args.max_length,
         "valid_tokens_used": used_tokens,
-        "cosine_definition": "mean paired-token cosine similarity; blank if hidden sizes differ",
-        "cka_definition": "centered linear CKA over aligned valid-token rows",
+        "cosine_definition": "mean paired-token cosine similarity between A[i] and B[i]; blank if hidden sizes differ",
+        "cka_definition": "centered linear CKA between A[i] and B[i] over aligned valid-token rows",
         "layer_index": "0 is embedding output; 1..N are transformer block outputs",
+        "comparison": "same-numbered layers only; no cross-layer matching",
     }
-    csv_path, matrix_path, plot_path = save_outputs(rows, cosine_matrix, cka_matrix, out_dir, metadata)
-    print(f"Compared {len(states_a)} x {len(states_b)} hidden-state layers using {used_tokens} token positions.")
-    print(f"Saved layer-pair metrics: {csv_path}")
-    print(f"Saved matrices: {matrix_path}\nSaved heatmaps: {plot_path}")
-    print("Layer A | Layer B | cosine similarity | linear CKA")
+    csv_path, metrics_path, plot_path = save_outputs(rows, cosine_values, cka_values, out_dir, metadata)
+    print(f"Compared same-numbered layers ({len(states_a)} layers) using {used_tokens} token positions.")
+    print(f"Saved same-layer metrics: {csv_path}")
+    print(f"Saved arrays: {metrics_path}\nSaved plot: {plot_path}")
+    print("Layer | cosine similarity | linear CKA")
     for row in rows:
         cosine_text = "N/A" if row["cosine_similarity"] == "" else f"{row['cosine_similarity']:.5f}"
-        print(f"{row['layer_a']:7d} | {row['layer_b']:7d} | {cosine_text:17s} | {row['linear_cka']:.5f}")
+        print(f"{row['layer']:5d} | {cosine_text:17s} | {row['linear_cka']:.5f}")
 
 
 if __name__ == "__main__":
