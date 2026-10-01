@@ -42,28 +42,64 @@ def load_data(directory):
     return directory, ids, logits, direction, token_ids, metadata
 
 
+def _set_overlap(ids_a, ids_b):
+    """Per-token Jaccard overlap for two top-k ID arrays."""
+    values = []
+    for left, right in zip(ids_a, ids_b):
+        a, b = set(int(x) for x in left), set(int(x) for x in right)
+        values.append(len(a & b) / max(len(a | b), 1))
+    return np.asarray(values, dtype=np.float64)
+
+
+def _shared_logit_deltas(ids_a, logits_a, ids_b, logits_b):
+    """Return B-A projected-logit changes only for identical vocabulary IDs."""
+    means, positives, counts = [], [], []
+    for ai, av, bi, bv in zip(ids_a, logits_a, ids_b, logits_b):
+        left = {int(token): float(value) for token, value in zip(ai, av)}
+        right = {int(token): float(value) for token, value in zip(bi, bv)}
+        common = sorted(set(left) & set(right))
+        if not common:
+            means.append(np.nan); positives.append(np.nan); counts.append(0)
+            continue
+        delta = np.asarray([right[token] - left[token] for token in common], dtype=np.float64)
+        means.append(float(delta.mean()))
+        positives.append(float(np.mean(delta > 0)))
+        counts.append(len(common))
+    return np.asarray(means), np.asarray(positives), np.asarray(counts)
+
+
 def analyze(ids, logits, direction, token_ids, metadata, top_k):
     model_a, model_b = 0, 1
     layers, tokens, saved_k = ids.shape[1:]
     k = saved_k if top_k is None else min(top_k, saved_k)
     rows = []
     for layer in range(layers):
-        a_ids = ids[model_a, layer, :, :k]
-        b_ids = ids[model_b, layer, :, :k]
-        a_logits = logits[model_a, layer, :, :k]
-        b_logits = logits[model_b, layer, :, :k]
+        a_ids, b_ids = ids[model_a, layer, :, :k], ids[model_b, layer, :, :k]
+        a_logits, b_logits = logits[model_a, layer, :, :k], logits[model_b, layer, :, :k]
         same_top1 = float(np.mean(a_ids[:, 0] == b_ids[:, 0]))
-        overlap = np.mean(np.any(a_ids[:, :, None] == b_ids[:, None, :], axis=2), axis=1)
-        delta = b_logits - a_logits
+        overlap = _set_overlap(a_ids, b_ids)
+        shared_delta, shared_positive, shared_count = _shared_logit_deltas(a_ids, a_logits, b_ids, b_logits)
+        if layer == 0:
+            base_stability = k0_stability = np.full(tokens, np.nan)
+        else:
+            base_stability = _set_overlap(ids[model_a, layer - 1, :, :k], a_ids)
+            k0_stability = _set_overlap(ids[model_b, layer - 1, :, :k], b_ids)
+        base_stability_mean = float(np.nanmean(base_stability)) if layer > 0 else float("nan")
+        k0_stability_mean = float(np.nanmean(k0_stability)) if layer > 0 else float("nan")
         rows.append({
             "layer": layer,
             "base_direction_cosine_mean": float(direction[model_a, layer].mean()),
             "k0_direction_cosine_mean": float(direction[model_b, layer].mean()),
             "direction_cosine_gap_k0_minus_base": float(direction[model_b, layer].mean() - direction[model_a, layer].mean()),
             "top1_token_agreement": same_top1,
-            "top_k_token_overlap_mean": float(overlap.mean()),
-            "top_k_logit_delta_mean": float(np.nanmean(delta)),
-            "top_k_logit_delta_max": float(np.nanmax(delta)),
+            "top_k_jaccard_base_vs_k0": float(overlap.mean()),
+            "shared_token_count_mean": float(np.mean(shared_count)),
+            "shared_logit_delta_mean_k0_minus_base": float(np.nanmean(shared_delta)),
+            "shared_logit_abs_mean": float(np.nanmean(np.abs(shared_delta))),
+            "shared_logit_positive_fraction": float(np.nanmean(shared_positive)),
+            "base_adjacent_top_k_jaccard": base_stability_mean,
+            "k0_adjacent_top_k_jaccard": k0_stability_mean,
+            "adjacent_stability_gap_k0_minus_base": (k0_stability_mean - base_stability_mean) if layer > 0 else float("nan"),
             "tokens": tokens,
         })
     return rows
@@ -81,8 +117,12 @@ def save_outputs(out_dir, rows, ids, logits, direction, token_ids, metadata):
                         base_direction_cosine=np.asarray([r["base_direction_cosine_mean"] for r in rows]),
                         k0_direction_cosine=np.asarray([r["k0_direction_cosine_mean"] for r in rows]),
                         top1_token_agreement=np.asarray([r["top1_token_agreement"] for r in rows]),
-                        top_k_token_overlap=np.asarray([r["top_k_token_overlap_mean"] for r in rows]),
-                        top_k_logit_delta=np.asarray([r["top_k_logit_delta_mean"] for r in rows]))
+                        top_k_jaccard_base_vs_k0=np.asarray([r["top_k_jaccard_base_vs_k0"] for r in rows]),
+                        shared_logit_delta_mean=np.asarray([r["shared_logit_delta_mean_k0_minus_base"] for r in rows]),
+                        shared_logit_positive_fraction=np.asarray([r["shared_logit_positive_fraction"] for r in rows]),
+                        base_adjacent_top_k_jaccard=np.asarray([r["base_adjacent_top_k_jaccard"] for r in rows]),
+                        k0_adjacent_top_k_jaccard=np.asarray([r["k0_adjacent_top_k_jaccard"] for r in rows]),
+                        adjacent_stability_gap=np.asarray([r["adjacent_stability_gap_k0_minus_base"] for r in rows]))
     (out_dir / "analysis_metadata.json").write_text(json.dumps({
         "source_metadata": metadata,
         "definition": "Per-layer summary of top-k projected logit-lens outputs",
@@ -93,27 +133,50 @@ def save_outputs(out_dir, rows, ids, logits, direction, token_ids, metadata):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     layers = np.asarray([r["layer"] for r in rows])
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    axes = axes.ravel()
     axes[0].plot(layers, [r["base_direction_cosine_mean"] for r in rows], label="base", marker="o")
     axes[0].plot(layers, [r["k0_direction_cosine_mean"] for r in rows], label="k0", marker="o")
     axes[0].set_title("Direction cosine to final layer")
     axes[0].set_ylabel("cosine")
     axes[0].legend()
-    axes[1].plot(layers, [r["top1_token_agreement"] for r in rows], marker="o", color="#7c3aed")
-    axes[1].set_title("Top-1 token agreement")
-    axes[1].set_ylabel("fraction")
-    axes[2].plot(layers, [r["top_k_token_overlap_mean"] for r in rows], marker="o", color="#059669", label="top-k overlap")
-    axes[2].plot(layers, [r["top_k_logit_delta_mean"] for r in rows], marker="o", color="#dc2626", label="k0-base top-k logit delta")
-    axes[2].set_title("Top-k changes")
+    axes[1].plot(layers, [r["top_k_jaccard_base_vs_k0"] for r in rows], marker="o", color="#7c3aed")
+    axes[1].set_title("Base vs k0 top-k Jaccard")
+    axes[1].set_ylabel("Jaccard overlap")
+    axes[2].plot(layers, [r["shared_logit_delta_mean_k0_minus_base"] for r in rows], marker="o", color="#dc2626", label="mean shared-token delta")
+    axes[2].plot(layers, [r["shared_logit_positive_fraction"] for r in rows], marker="o", color="#ea580c", label="positive-delta fraction")
+    axes[2].axhline(0, color="black", linewidth=.8)
+    axes[2].set_title("Watermark logit-lens shift on shared tokens")
+    axes[2].set_ylabel("delta / fraction")
     axes[2].legend(fontsize=8)
+    axes[3].plot(layers, [r["base_adjacent_top_k_jaccard"] for r in rows], marker="o", label="base")
+    axes[3].plot(layers, [r["k0_adjacent_top_k_jaccard"] for r in rows], marker="o", label="k0")
+    axes[3].plot(layers, [r["adjacent_stability_gap_k0_minus_base"] for r in rows], linestyle="--", label="k0-base gap")
+    axes[3].set_title("Adjacent-layer top-k stability")
+    axes[3].set_ylabel("Jaccard / gap")
+    axes[3].legend(fontsize=8)
     for ax in axes:
         ax.set_xlabel("hidden-state layer (0 = embedding)")
         ax.grid(alpha=.25)
+    fig.suptitle("Logit-lens watermark onset and propagation diagnostics")
     fig.tight_layout()
     plot_path = out_dir / "logit_lens_analysis.png"
     fig.savefig(plot_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
-    return csv_path, plot_path
+
+    # Layerwise aggregate plot is more interpretable than a huge token heatmap.
+    fig2, ax2 = plt.subplots(figsize=(10, 4.8))
+    ax2.plot(layers, [r["shared_token_count_mean"] for r in rows], marker="o", label="shared top-k token count")
+    ax2.plot(layers, [r["shared_logit_abs_mean"] for r in rows], marker="o", label="|shared logit delta|")
+    ax2.set_title("Watermark signal magnitude on shared top-k vocabulary")
+    ax2.set_xlabel("hidden-state layer")
+    ax2.grid(alpha=.25)
+    ax2.legend()
+    fig2.tight_layout()
+    magnitude_path = out_dir / "logit_lens_signal_magnitude.png"
+    fig2.savefig(magnitude_path, dpi=170, bbox_inches="tight")
+    plt.close(fig2)
+    return csv_path, plot_path, magnitude_path
 
 
 def main():
@@ -121,13 +184,15 @@ def main():
     source, ids, logits, direction, token_ids, metadata = load_data(args.input_dir)
     rows = analyze(ids, logits, direction, token_ids, metadata, args.top_k)
     out = Path(args.output_dir) if args.output_dir else source
-    csv_path, plot_path = save_outputs(out, rows, ids, logits, direction, token_ids, metadata)
+    csv_path, plot_path, magnitude_path = save_outputs(out, rows, ids, logits, direction, token_ids, metadata)
     print(f"Saved summary table: {csv_path}")
     print(f"Saved analysis plot: {plot_path}")
-    print("Layer | base direction | k0 direction | top1 agreement | top-k overlap")
+    print(f"Saved signal magnitude plot: {magnitude_path}")
+    print("Layer | base direction | k0 direction | base/k0 Jaccard | shared delta | adjacent stability gap")
     for row in rows:
         print(f"{row['layer']:5d} | {row['base_direction_cosine_mean']:.5f} | {row['k0_direction_cosine_mean']:.5f} | "
-              f"{row['top1_token_agreement']:.5f} | {row['top_k_token_overlap_mean']:.5f}")
+              f"{row['top_k_jaccard_base_vs_k0']:.5f} | {row['shared_logit_delta_mean_k0_minus_base']:.5f} | "
+              f"{row['adjacent_stability_gap_k0_minus_base']:.5f}")
 
 
 if __name__ == "__main__":
