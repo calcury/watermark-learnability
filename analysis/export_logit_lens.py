@@ -158,18 +158,18 @@ def collect_lens(source, encoded, token, device, trust_remote_code, top_k, max_t
     norm_device = next(norm.parameters()).device
     head_device = next(head.parameters()).device
     final = norm(torch.from_numpy(hidden[-1]).to(norm_device)).float()
-    final = final.cpu().numpy()
+    final = final.detach().cpu().numpy()
     for layer, state in enumerate(hidden):
         normalized = norm(torch.from_numpy(state).to(norm_device)).float()
         projected = head(normalized.to(head_device)).float()
         values, indices = torch.topk(projected, k=min(top_k, projected.shape[-1]), dim=-1)
         k = values.shape[-1]
-        top_values[layer, :, :k] = values.cpu().numpy()
-        top_ids[layer, :, :k] = indices.cpu().numpy()
+        top_values[layer, :, :k] = values.detach().cpu().numpy()
+        top_ids[layer, :, :k] = indices.detach().cpu().numpy()
         if k < top_k:
             top_values[layer, :, k:] = np.nan
             top_ids[layer, :, k:] = -1
-        a = normalized.cpu().numpy()
+        a = normalized.detach().cpu().numpy()
         an = np.linalg.norm(a, axis=1).clip(min=1e-12)
         fn = np.linalg.norm(final, axis=1).clip(min=1e-12)
         direction_cosine[layer] = np.sum(a * final, axis=1) / (an * fn)
