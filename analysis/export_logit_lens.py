@@ -155,13 +155,15 @@ def collect_lens(source, encoded, token, device, trust_remote_code, top_k, max_t
     top_ids = np.empty((layers, len(ids), top_k), dtype=np.int32)
     top_values = np.empty((layers, len(ids), top_k), dtype=np.float32)
     direction_cosine = np.empty((layers, len(ids)), dtype=np.float32)
-    norm_device = next(norm.parameters()).device
-    head_device = next(head.parameters()).device
-    final = norm(torch.from_numpy(hidden[-1]).to(norm_device)).float()
+    norm_param = next(norm.parameters())
+    head_param = next(head.parameters())
+    norm_device, norm_dtype = norm_param.device, norm_param.dtype
+    head_device, head_dtype = head_param.device, head_param.dtype
+    final = norm(torch.from_numpy(hidden[-1]).to(device=norm_device, dtype=norm_dtype)).float()
     final = final.detach().cpu().numpy()
     for layer, state in enumerate(hidden):
-        normalized = norm(torch.from_numpy(state).to(norm_device)).float()
-        projected = head(normalized.to(head_device)).float()
+        normalized = norm(torch.from_numpy(state).to(device=norm_device, dtype=norm_dtype)).float()
+        projected = head(normalized.to(device=head_device, dtype=head_dtype)).float()
         values, indices = torch.topk(projected, k=min(top_k, projected.shape[-1]), dim=-1)
         k = values.shape[-1]
         top_values[layer, :, :k] = values.detach().cpu().numpy()
