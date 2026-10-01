@@ -143,6 +143,9 @@ def collect_lens(source, encoded, token, device, trust_remote_code, top_k, max_t
                 hidden_chunks[layer].append(state[valid].float().cpu())
             id_chunks.append(inputs["input_ids"][valid].cpu())
             del output, inputs
+    if hidden_chunks is None or not id_chunks:
+        raise ValueError("No hidden states or valid token positions were collected")
+    layers = len(hidden_chunks)
     ids = torch.cat(id_chunks).numpy()
     hidden = [torch.cat(chunks).numpy() for chunks in hidden_chunks]
     if ids.shape[0] > max_tokens:
