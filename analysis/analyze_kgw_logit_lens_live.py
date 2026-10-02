@@ -151,16 +151,31 @@ def collect_hidden(model_source, encoded_batches, token, device, trust_remote_co
     head_module = model.get_output_embeddings()
     captured = {"norm_weight": None, "norm_bias": None, "head_weight": None, "head_bias": None}
 
+    def read_real_parameter(module, parameter_name):
+        parameter = getattr(module, parameter_name, None)
+        if parameter is not None and not parameter.is_meta:
+            return parameter.detach().float().cpu().clone()
+        # Accelerate disk offload keeps the actual checkpoint tensor in
+        # weights_map while module parameters are meta placeholders.
+        hook = getattr(module, "_hf_hook", None)
+        weights_map = getattr(hook, "weights_map", None)
+        if weights_map is not None:
+            try:
+                value = weights_map[parameter_name]
+                if isinstance(value, torch.Tensor) and not value.is_meta:
+                    return value.detach().float().cpu().clone()
+            except (KeyError, TypeError, AttributeError):
+                pass
+        return None
+
     def capture_norm(module, inputs):
-        captured["norm_weight"] = module.weight.detach().float().cpu().clone()
-        bias = getattr(module, "bias", None)
-        captured["norm_bias"] = bias.detach().float().cpu().clone() if bias is not None else None
+        captured["norm_weight"] = read_real_parameter(module, "weight")
+        captured["norm_bias"] = read_real_parameter(module, "bias")
 
     def capture_head(module, inputs):
         if captured["head_weight"] is None:
-            captured["head_weight"] = module.weight.detach().float().cpu().clone()
-            bias = getattr(module, "bias", None)
-            captured["head_bias"] = bias.detach().float().cpu().clone() if bias is not None else None
+            captured["head_weight"] = read_real_parameter(module, "weight")
+            captured["head_bias"] = read_real_parameter(module, "bias")
 
     norm_hook = norm_module.register_forward_pre_hook(capture_norm)
     head_hook = head_module.register_forward_pre_hook(capture_head)
