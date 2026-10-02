@@ -15,9 +15,17 @@ layers where it was not among the saved top-k candidates.
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
+
+# When executed as ``python analysis/...py``, Python puts ``analysis/`` first
+# on sys.path. Add the repository root so the local ``watermarks`` namespace
+# package is importable from Colab and other working directories.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def parse_args():
