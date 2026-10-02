@@ -255,9 +255,13 @@ def plot_outputs(out, top_ids, top_logits, token_ids, positions, top_k, candidat
             base_values = np.asarray([matching.get(f"base_layer_{layer}_logit", np.nan) for layer in layers], dtype=float)
             k0_values = np.asarray([matching.get(f"k0_layer_{layer}_logit", np.nan) for layer in layers], dtype=float)
             delta = k0_values - base_values
-            ax.plot(layers, delta, color="#9ca3af", alpha=.55, linewidth=1.0)
+            # Color the entire candidate trajectory by its KGW class. Green
+            # candidates stay green and red candidates stay red across all
+            # observed layers; NaNs remain gaps because those logits were not
+            # saved outside the per-layer top-k.
+            final_color = "#16a34a" if matching["kgw_is_green"] else "#dc2626"
+            ax.plot(layers, delta, color=final_color, alpha=.65, linewidth=1.25)
             if np.isfinite(delta[-2]) and np.isfinite(delta[-1]):
-                final_color = "#16a34a" if matching["kgw_is_green"] else "#dc2626"
                 ax.plot(layers[-2:], delta[-2:], color=final_color, linewidth=2.8)
                 ax.scatter(layers[-1], delta[-1], color=final_color, s=20, zorder=4)
         ax.axhline(0, color="black", linewidth=.8)
