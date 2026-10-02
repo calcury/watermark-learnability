@@ -204,7 +204,10 @@ def plot_outputs(out, top_ids, top_logits, token_ids, positions, top_k, candidat
     fig.savefig(trajectory_path, dpi=170, bbox_inches="tight"); plt.close(fig)
 
     # Figure 2: fixed final-layer candidates. Missing values are intentional.
-    fig, axes = plt.subplots(len(positions), 2, figsize=(16, max(5, 3.2 * len(positions))), squeeze=False)
+    # Share the y-axis between base and k0 for each position. Independent
+    # autoscaling can make different curves look deceptively identical.
+    fig, axes = plt.subplots(len(positions), 2, figsize=(16, max(5, 3.2 * len(positions))),
+                             squeeze=False, sharey="row")
     for row_index, position in enumerate(positions):
         candidates = sorted({r["candidate_token_id"] for r in fixed_rows if r["position"] == position})
         for model_index, model in enumerate(models):
@@ -229,7 +232,34 @@ def plot_outputs(out, top_ids, top_logits, token_ids, positions, top_k, candidat
     fixed_path = out / "final_candidate_logit_trajectories.png"
     fig.savefig(fixed_path, dpi=170, bbox_inches="tight"); plt.close(fig)
 
-    return trajectory_path, fixed_path
+    # Directly plot k0 - base for the same candidate token. This avoids
+    # judging subtle differences by comparing two separately scaled panels.
+    fig, axes = plt.subplots(len(positions), 1, figsize=(11, max(4, 2.8 * len(positions))),
+                             squeeze=False, sharex=True)
+    for row_index, position in enumerate(positions):
+        ax = axes[row_index, 0]
+        candidates = sorted({r["candidate_token_id"] for r in fixed_rows if r["position"] == position})
+        for candidate in candidates[:candidate_count]:
+            matching = next(r for r in fixed_rows if r["position"] == position and r["candidate_token_id"] == candidate)
+            base_values = np.asarray([matching.get(f"base_layer_{layer}_logit", np.nan) for layer in layers], dtype=float)
+            k0_values = np.asarray([matching.get(f"k0_layer_{layer}_logit", np.nan) for layer in layers], dtype=float)
+            delta = k0_values - base_values
+            ax.plot(layers, delta, color="#9ca3af", alpha=.55, linewidth=1.0)
+            if np.isfinite(delta[-2]) and np.isfinite(delta[-1]):
+                final_color = "#16a34a" if matching["kgw_is_green"] else "#dc2626"
+                ax.plot(layers[-2:], delta[-2:], color=final_color, linewidth=2.8)
+                ax.scatter(layers[-1], delta[-1], color=final_color, s=20, zorder=4)
+        ax.axhline(0, color="black", linewidth=.8)
+        ax.axvline(layers[-2], color="black", linestyle="--", linewidth=.8, alpha=.6)
+        ax.set_ylabel(f"pos {position}\\nk0-base")
+        ax.grid(alpha=.25)
+    axes[-1, 0].set_xlabel("hidden-state layer")
+    fig.suptitle("Direct same-token logit difference (k0 - base)", y=.995)
+    fig.tight_layout()
+    delta_path = out / "final_candidate_logit_delta.png"
+    fig.savefig(delta_path, dpi=170, bbox_inches="tight"); plt.close(fig)
+
+    return trajectory_path, fixed_path, delta_path
 
 
 def main():
