@@ -26,11 +26,18 @@ WATERMARK_REPOS = {
     "llama": "cygu/llama-2-7b-logit-watermark-distill-kgw-{variant}-gamma0.25-delta{delta}",
     "pythia": "cygu/pythia-1.4b-sampling-watermark-distill-kgw-{variant}-gamma0.25-delta{delta}",
 }
+# Used only when neither --prompt nor --prompt-file is supplied. These are
+# fixed, varied contexts rather than randomly generated prompts, so repeated
+# exports remain directly comparable.
 DEFAULT_PROMPTS = [
     "Explain why the seasons change on Earth in a short paragraph.",
     "A careful scientist records uncertainty instead of hiding it.",
     "Write three practical suggestions for reducing household energy use.",
     "The old railway station stood at the edge of the town, where",
+    "Describe how a city can prepare for extreme heat while protecting vulnerable residents.",
+    "Give a concise explanation of why scientific experiments need control groups.",
+    "The historian opened the archive and discovered that the letter began with",
+    "List several ways to make a machine-learning model's predictions easier to evaluate.",
 ]
 
 

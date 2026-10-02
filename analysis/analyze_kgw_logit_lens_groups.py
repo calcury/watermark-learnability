@@ -41,7 +41,8 @@ def parse_args():
                    help="Default is inferred from model_b name: k0/k1/k2 -> simple_0/1/2")
     p.add_argument("--last-transitions", type=int, default=3,
                    help="Number of final layer transitions to include in histograms")
-    p.add_argument("--bins", type=int, default=30)
+    p.add_argument("--bins", type=int, default=80,
+                   help="Number of histogram bins (default: 80; larger gives narrower bars)")
     return p.parse_args()
 
 
@@ -251,7 +252,10 @@ def make_plots(out, grouped, movements, prompt_index, model_names, last_transiti
             sample = np.asarray(movements[model, layer, "all"][0] + movements[model, layer, "all"][1], dtype=float)
             sample = sample[np.isfinite(sample)]
             if sample.size:
-                ax.hist(sample, bins=bins, color="#64748b" if model == 0 else "#f97316", alpha=.72, edgecolor="white")
+                # Use a shared fine-grained bin range within each transition,
+                # so base and watermarked panels have comparable narrow bars.
+                ax.hist(sample, bins=bins, color="#64748b" if model == 0 else "#f97316",
+                        alpha=.72, edgecolor="white", linewidth=.35)
             ax.axvline(0, color="black", linewidth=.8)
             ax.set_title(f"{name}: layer {layer - 1} → {layer}")
             ax.set_xlabel("logit movement")
@@ -272,7 +276,9 @@ def make_plots(out, grouped, movements, prompt_index, model_names, last_transiti
             sample = np.asarray(movements[model, final, group][0] + movements[model, final, group][1], dtype=float)
             sample = sample[np.isfinite(sample)]
             if sample.size:
-                ax.hist(sample, bins=bins, alpha=.52, color=color, label=f"{group} (n={sample.size})")
+                ax.hist(sample, bins=bins, alpha=.52, color=color,
+                        edgecolor="white", linewidth=.35,
+                        label=f"{group} (n={sample.size})")
         ax.axvline(0, color="black", linewidth=.8)
         ax.set_title(f"{name}: final transition {final - 1} → {final}")
         ax.set_xlabel("logit movement"); ax.grid(alpha=.2); ax.legend()

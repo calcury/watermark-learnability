@@ -38,8 +38,10 @@ def parse_args():
                    help="Number of representative positions when --positions is omitted")
     p.add_argument("--top-k", type=int, default=None,
                    help="Use first K saved ranks; default uses all saved ranks")
-    p.add_argument("--candidate-count", type=int, default=12,
-                   help="Maximum final-layer candidate curves per position")
+    p.add_argument("--candidate-rank", type=int, default=10,
+                   help="Collect candidates appearing in top-N at any layer (default: 10)")
+    p.add_argument("--candidate-count", type=int, default=None,
+                   help="Optional maximum curves per position; default plots the full all-layer candidate union")
     p.add_argument("--tokenizer", default=None,
                    help="Optional tokenizer path/Hub ID for decoded token strings")
     p.add_argument("--kgw-gamma", type=float, default=0.25)
@@ -133,7 +135,7 @@ def build_kgw_green_mask(metadata, token_ids, tokenizer_path, hf_token, gamma, s
     return selected
 
 
-def build_tables(top_ids, top_logits, token_ids, positions, top_k, candidate_count, decode, green_sets):
+def build_tables(top_ids, top_logits, token_ids, positions, top_k, candidate_rank, candidate_count, decode, green_sets):
     models = ("base", "k0")
     layers = top_ids.shape[1]
     top1_rows, fixed_rows = [], []
@@ -148,10 +150,17 @@ def build_tables(top_ids, top_logits, token_ids, positions, top_k, candidate_cou
                     "model": model, "layer": layer, "top1_token_id": token,
                     "top1_token": decode(token), "top1_logit": value,
                 })
-        # Use final-layer top-1 candidates so the plot asks when the final
-        # decision became available in the preceding representation layers.
-        candidates = set(int(x) for model in range(2) for x in top_ids[model, -1, position, :top_k])
-        for candidate in sorted(candidates)[:candidate_count]:
+        # Use the union of candidates that appear in top-N at ANY layer and
+        # in either model. This exposes complete observed trajectories rather
+        # than selecting only final-layer winners.
+        rank = min(candidate_rank, top_k)
+        candidates = set(int(x) for model in range(2)
+                         for layer in range(layers)
+                         for x in top_ids[model, layer, position, :rank])
+        ordered_candidates = sorted(candidates)
+        if candidate_count is not None:
+            ordered_candidates = ordered_candidates[:candidate_count]
+        for candidate in ordered_candidates:
             row = {"position": position, "input_token_id": int(token_ids[position]),
                    "candidate_token_id": candidate, "candidate_token": decode(candidate),
                    "kgw_class": "green" if candidate in green_sets[position] else "red",
@@ -173,7 +182,7 @@ def write_csv(path, rows):
         writer.writeheader(); writer.writerows(rows)
 
 
-def plot_outputs(out, top_ids, top_logits, token_ids, positions, top_k, candidate_count, top1_rows, fixed_rows, decode):
+def plot_outputs(out, top_ids, top_logits, token_ids, positions, top_k, candidate_rank, candidate_count, top1_rows, fixed_rows, decode):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -212,7 +221,9 @@ def plot_outputs(out, top_ids, top_logits, token_ids, positions, top_k, candidat
         candidates = sorted({r["candidate_token_id"] for r in fixed_rows if r["position"] == position})
         for model_index, model in enumerate(models):
             ax = axes[row_index, model_index]
-            for candidate in candidates[:candidate_count]:
+            if candidate_count is not None:
+                candidates = candidates[:candidate_count]
+            for candidate in candidates:
                 matching = next(r for r in fixed_rows if r["position"] == position and r["candidate_token_id"] == candidate)
                 values = np.array([matching.get(f"{model}_layer_{layer}_logit", np.nan) for layer in layers], dtype=float)
                 # Neutral gray for the trajectory; color only the final
@@ -272,16 +283,19 @@ def main():
     decode = make_decoder(args.tokenizer, metadata)
     green_sets = build_kgw_green_mask(metadata, token_ids, args.tokenizer, args.hf_token,
                                       args.kgw_gamma, args.kgw_seeding_scheme)
+    candidate_rank = min(max(1, args.candidate_rank), top_k)
     top1_rows, fixed_rows = build_tables(top_ids, top_logits, token_ids, positions, top_k,
-                                         args.candidate_count, decode, green_sets)
+                                         candidate_rank, args.candidate_count, decode, green_sets)
     out = Path(args.output_dir) if args.output_dir else source / "trajectory_visualization"
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "selected_top1_tokens_by_layer.csv", top1_rows)
     write_csv(out / "selected_final_candidate_logits_by_layer.csv", fixed_rows)
     paths = plot_outputs(out, top_ids, top_logits, token_ids, positions, top_k,
-                         args.candidate_count, top1_rows, fixed_rows, decode)
+                         candidate_rank, args.candidate_count, top1_rows, fixed_rows, decode)
     (out / "visualization_metadata.json").write_text(json.dumps({
         "source_metadata": metadata, "selected_positions": positions, "top_k": top_k,
+        "candidate_rank": candidate_rank, "candidate_count": args.candidate_count,
+        "candidate_definition": "union of tokens appearing in either model's top-N at any layer",
         "limitation": "fixed-token curves are NaN when the token is outside saved top-k at a layer",
         "interpretation": "each layer is a projection of the same hidden position, not a generated decoding timestep",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
