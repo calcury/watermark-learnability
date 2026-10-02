@@ -32,9 +32,13 @@ def parse_args():
                    help="Use analysis/fetch_pythia.py to fetch the default local base if missing")
     p.add_argument("--dataset", default=None, help="Override the sampling-distillation Hugging Face dataset ID")
     p.add_argument("--output-dir", default=None)
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    p.add_argument("--block-size", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=32)
+    p.add_argument("--block-size", type=int, default=128)
+    p.add_argument("--optim", default="adafactor",
+                   help="Optimizer; adafactor is the low-memory default for 16 GB-class GPUs")
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True,
+                   help="Trade compute for lower activation memory")
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--learning-rate", type=float, default=1e-5)
     p.add_argument("--warmup-steps", type=int, default=500)
@@ -82,6 +86,7 @@ def main():
         "--lr_scheduler_type", "cosine", "--warmup_steps", str(args.warmup_steps),
         "--block_size", str(args.block_size), "--per_device_train_batch_size", str(args.batch_size),
         "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
+        "--optim", args.optim,
         "--num_train_epochs", str(args.epochs), "--group_texts", "True",
         "--seed", str(args.seed), "--alignment_loss_weight", str(args.alignment_loss_weight),
         "--alignment_reference_device", args.reference_device,
@@ -92,6 +97,8 @@ def main():
         command.extend(["--max_train_samples", str(args.max_train_samples)])
     if args.resume_from_checkpoint:
         command.extend(["--resume_from_checkpoint", args.resume_from_checkpoint])
+    if args.gradient_checkpointing:
+        command.extend(["--gradient_checkpointing", "True"])
     if args.bf16:
         command.extend(["--bf16", "True"])
     if args.fp16:
