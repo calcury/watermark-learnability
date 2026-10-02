@@ -207,7 +207,23 @@ def write_csv(path, rows):
         writer.writeheader(); writer.writerows(rows)
 
 
-def make_plots(out, grouped, movements, prompt_index, model_names, last_transitions, bins):
+def raw_gap_by_prompt(grouped, prompt_index):
+    """Return [model, prompt, layer] green-minus-red mean-logit gaps."""
+    prompts = sorted(set(prompt_index.tolist()))
+    layers = grouped[0]["green"].shape[0]
+    gaps = np.full((2, len(prompts), layers), np.nan, dtype=np.float64)
+    for model in range(2):
+        for prompt_row, prompt in enumerate(prompts):
+            selected = np.flatnonzero(prompt_index == prompt)
+            for layer in range(layers):
+                green = grouped[model]["green"][layer, selected]
+                red = grouped[model]["red"][layer, selected]
+                if np.isfinite(green).any() and np.isfinite(red).any():
+                    gaps[model, prompt_row, layer] = np.nanmean(green) - np.nanmean(red)
+    return prompts, gaps
+
+
+def make_plots(out, grouped, movements, prompt_index, model_names, last_transitions, bins, raw_gaps):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -287,7 +303,48 @@ def make_plots(out, grouped, movements, prompt_index, model_names, last_transiti
     fig.tight_layout()
     gap_path = out / "kgw_final_green_red_movement_gap.png"
     fig.savefig(gap_path, dpi=170, bbox_inches="tight"); plt.close(fig)
-    return movement_path, hist_path, gap_path
+    # Detailed diagnostic: raw green-red gap and its layer-to-layer change.
+    prompts, gaps = raw_gaps
+    fig, axes = plt.subplots(len(prompts), 2, figsize=(15, max(5, 3.2 * len(prompts))),
+                             squeeze=False, sharex=True)
+    for row, prompt in enumerate(prompts):
+        for model, name in enumerate(model_names):
+            ax = axes[row, model]
+            ax.plot(np.arange(layers), gaps[model, row], color="#16a34a", linewidth=1.8,
+                    label="green mean − red mean")
+            if layers > 1:
+                ax.plot(np.arange(1, layers), np.diff(gaps[model, row]), color="#7c3aed",
+                        linestyle="--", linewidth=1.2, label="change in gap")
+            ax.axhline(0, color="black", linewidth=.8)
+            ax.axvline(layers - 1.5, color="gray", linestyle=":", linewidth=1)
+            ax.set_title(f"Prompt {prompt}: {name}")
+            ax.set_ylabel("raw gap / gap change")
+            ax.grid(alpha=.25)
+            ax.legend(fontsize=8)
+    axes[-1, 0].set_xlabel("hidden-state layer")
+    axes[-1, 1].set_xlabel("hidden-state layer")
+    fig.suptitle("When does the KGW green-red logit gap appear?")
+    fig.tight_layout()
+    raw_path = out / "kgw_raw_green_red_gap_by_prompt.png"
+    fig.savefig(raw_path, dpi=170, bbox_inches="tight"); plt.close(fig)
+
+    # Direct onset view: watermarked raw gap, base raw gap, and extra gap.
+    fig, ax = plt.subplots(figsize=(12, 5))
+    base_mean = np.nanmean(gaps[0], axis=0)
+    water_mean = np.nanmean(gaps[1], axis=0)
+    extra = water_mean - base_mean
+    ax.plot(np.arange(layers), base_mean, color="#2563eb", label="base raw green-red gap")
+    ax.plot(np.arange(layers), water_mean, color="#f97316", label="watermarked raw green-red gap")
+    ax.plot(np.arange(layers), extra, color="#7c3aed", linestyle="--", label="watermarked minus base gap")
+    ax.axhline(0, color="black", linewidth=.8)
+    ax.axvline(layers - 1.5, color="gray", linestyle=":", linewidth=1)
+    ax.set_title("Average KGW green-red gap and watermark-specific excess")
+    ax.set_xlabel("hidden-state layer"); ax.set_ylabel("mean projected-logit gap")
+    ax.grid(alpha=.25); ax.legend()
+    fig.tight_layout()
+    onset_path = out / "kgw_gap_onset_summary.png"
+    fig.savefig(onset_path, dpi=170, bbox_inches="tight"); plt.close(fig)
+    return movement_path, hist_path, gap_path, raw_path, onset_path
 
 
 def main():
@@ -313,11 +370,16 @@ def main():
     out = Path(args.output_dir) if args.output_dir else source / "kgw_group_analysis"
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "kgw_group_layer_summary.csv", rows)
-    plot_paths = make_plots(out, grouped, movements, prompt_index, model_names, args.last_transitions, args.bins)
+    raw_gaps = raw_gap_by_prompt(grouped, prompt_index)
+    plot_paths = make_plots(out, grouped, movements, prompt_index, model_names,
+                            args.last_transitions, args.bins, raw_gaps)
     np.savez_compressed(out / "kgw_group_metrics.npz",
                         green=np.stack([grouped[0]["green"], grouped[1]["green"]]),
                         red=np.stack([grouped[0]["red"], grouped[1]["red"]]),
-                        prompt_index=prompt_index)
+                        prompt_index=prompt_index,
+                        raw_green_red_gap=raw_gaps[1],
+                        raw_green_red_gap_base=raw_gaps[1][0],
+                        raw_green_red_gap_watermarked=raw_gaps[1][1])
     (out / "kgw_group_metadata.json").write_text(json.dumps({
         "source_metadata": metadata, "model_names": model_names,
         "kgw_gamma": args.kgw_gamma, "kgw_seeding_scheme": scheme, "top_k": top_k,
