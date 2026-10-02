@@ -286,7 +286,14 @@ class SamplingDistillTrainer(Trainer):
     def __init__(self, *args, alignment_loss_weight=0.0, alignment_reference_model=None,
                  alignment_positions_per_sequence=8, kgw_gamma=0.25,
                  kgw_seeding_scheme="simple_1", **kwargs):
+        trainer_init_params = inspect.signature(Trainer.__init__).parameters
+        alignment_tokenizer = kwargs.pop("tokenizer", None)
+        if alignment_tokenizer is not None:
+            tokenizer_arg = "processing_class" if "processing_class" in trainer_init_params else "tokenizer"
+            kwargs[tokenizer_arg] = alignment_tokenizer
         super().__init__(*args, **kwargs)
+        self.alignment_tokenizer = alignment_tokenizer or getattr(
+            self, "processing_class", getattr(self, "tokenizer", None))
         self.alignment_loss_weight = float(alignment_loss_weight)
         self.alignment_reference_model = alignment_reference_model
         self.alignment_positions_per_sequence = max(1, int(alignment_positions_per_sequence))
@@ -302,7 +309,7 @@ class SamplingDistillTrainer(Trainer):
             self.alignment_reference_model.eval()
             self.alignment_reference_model.requires_grad_(False)
             self.kgw_mask_builder = WatermarkBase(
-                vocab=list(range(len(self.tokenizer))), gamma=self.kgw_gamma,
+                vocab=list(range(len(self.alignment_tokenizer))), gamma=self.kgw_gamma,
                 seeding_scheme=self.kgw_seeding_scheme, device="cpu")
             if self.kgw_mask_builder.self_salt:
                 raise ValueError("alignment loss currently supports non-self-salted KGW schemes only")
@@ -333,7 +340,7 @@ class SamplingDistillTrainer(Trainer):
         if ref_logits.shape != shift_logits.shape:
             raise ValueError("Reference and student logits have different shapes")
 
-        alignment_vocab_size = len(self.tokenizer)
+        alignment_vocab_size = len(self.alignment_tokenizer)
         if alignment_vocab_size > shift_logits.shape[-1]:
             raise ValueError("Tokenizer has more IDs than the model logit head")
         input_ids = model_inputs["input_ids"]
