@@ -146,6 +146,32 @@ def group_arrays(ids, logits, green_sets, top_k):
     return result
 
 
+def token_movements(ids, logits, green_sets, prompt_index, top_k):
+    """Return per-token movement values matched by vocabulary ID across layers.
+
+    Unlike group_arrays(), this does not average all green/red candidates within
+    a position first. Each vocabulary token that appears in both adjacent
+    layers contributes one movement observation.
+    """
+    models, layers, positions, _ = ids.shape
+    result = {}
+    for model in range(models):
+        result[model] = {}
+        for layer in range(1, layers):
+            for group in ("green", "red", "all"):
+                result[model, layer, group] = {int(prompt): [] for prompt in sorted(set(prompt_index.tolist()))}
+            for position in range(positions):
+                previous = {int(t): float(v) for t, v in zip(ids[model, layer - 1, position, :top_k], logits[model, layer - 1, position, :top_k])}
+                current = {int(t): float(v) for t, v in zip(ids[model, layer, position, :top_k], logits[model, layer, position, :top_k])}
+                for token in set(previous) & set(current):
+                    movement = current[token] - previous[token]
+                    group = "green" if token in green_sets[position] else "red"
+                    prompt = int(prompt_index[position])
+                    result[model, layer, group][prompt].append(movement)
+                    result[model, layer, "all"][prompt].append(movement)
+    return result
+
+
 def rows_for_csv(grouped, prompt_index, model_names):
     layers, positions = grouped[0]["green"].shape
     rows = []
@@ -180,83 +206,78 @@ def write_csv(path, rows):
         writer.writeheader(); writer.writerows(rows)
 
 
-def make_plots(out, grouped, prompt_index, model_names, last_transitions, bins):
+def make_plots(out, grouped, movements, prompt_index, model_names, last_transitions, bins):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     layers = grouped[0]["green"].shape[0]
     prompts = sorted(set(prompt_index.tolist()))
-    colors = {"base": "#2563eb", "k1": "#f97316", "k0": "#f97316"}
-    # Prompt-specific mean movement curves: one subplot per prompt.
+    # Plot the mean movement of all matched vocabulary tokens in each KGW
+    # group. Color encodes KGW class; line style encodes model.
     fig, axes = plt.subplots(len(prompts), 1, figsize=(12, max(5, 3.0 * len(prompts))), squeeze=False, sharex=True)
     for row, prompt in enumerate(prompts):
         ax = axes[row, 0]
-        selected = np.flatnonzero(prompt_index == prompt)
         for model, name in enumerate(model_names):
-            color = colors.get(name, ["#2563eb", "#f97316"][model])
-            for group, linestyle in (("green", "-"), ("red", "--")):
-                values = grouped[model][group][:, selected]
-                movement = np.full(layers, np.nan)
+            for group, color in (("green", "#16a34a"), ("red", "#dc2626")):
+                values = np.full(layers, np.nan)
                 for layer in range(1, layers):
-                    delta = values[layer] - values[layer - 1]
-                    movement[layer] = np.nanmean(delta) if np.isfinite(delta).any() else np.nan
-                ax.plot(np.arange(layers), movement, color=color, linestyle=linestyle,
-                        linewidth=1.8, label=f"{name} {group}")
+                    sample = np.asarray(movements[model, layer, group][prompt], dtype=float)
+                    if sample.size:
+                        values[layer] = np.mean(sample)
+                style = "-" if model == 0 else "--"
+                ax.plot(np.arange(layers), values, color=color, linestyle=style,
+                        linewidth=2.0, label=f"{name} {group}")
         ax.axhline(0, color="black", linewidth=.8)
         ax.axvline(layers - 1.5, color="gray", linestyle=":", linewidth=1)
-        ax.set_title(f"Prompt {prompt}: green/red mean layer movement")
+        ax.set_title(f"Prompt {prompt}: mean movement of matched tokens")
         ax.set_ylabel("Δ logit")
         ax.grid(alpha=.25)
         ax.legend(ncol=4, fontsize=8)
-    axes[-1, 0].set_xlabel("hidden-state layer transition (value at l = l - l-1)")
-    fig.suptitle("KGW green/red logit-lens movement by prompt")
+    axes[-1, 0].set_xlabel("layer transition (value at l = l - 1)")
+    fig.suptitle("KGW green/red mean logit-lens movement: base vs watermarked")
     fig.tight_layout()
     movement_path = out / "kgw_group_movement_by_prompt.png"
     fig.savefig(movement_path, dpi=170, bbox_inches="tight"); plt.close(fig)
 
-    # Histograms of per-position movements for final transitions. Green/red
-    # distributions are plotted separately; no averaging over positions.
+    # For each requested late transition, pool all matched token movements
+    # across prompts and positions. Base should be near a central distribution;
+    # a KGW split in the watermarked model can produce two peaks.
     transition_layers = list(range(max(1, layers - last_transitions), layers))
-    fig, axes = plt.subplots(len(transition_layers), 1, figsize=(11, max(4, 3.4 * len(transition_layers))), squeeze=False)
+    fig, axes = plt.subplots(len(transition_layers), 2, figsize=(15, max(4, 3.4 * len(transition_layers))), squeeze=False, sharex="row")
     for row, layer in enumerate(transition_layers):
-        ax = axes[row, 0]
         for model, name in enumerate(model_names):
-            color = colors.get(name, ["#2563eb", "#f97316"][model])
-            for group, group_color in (("green", "#16a34a"), ("red", "#dc2626")):
-                current = grouped[model][group][layer]
-                previous = grouped[model][group][layer - 1]
-                movement = current - previous
-                movement = movement[np.isfinite(movement)]
-                if movement.size:
-                    label = f"{name} {group} (n={movement.size})"
-                    ax.hist(movement, bins=bins, alpha=.38, color=group_color,
-                            edgecolor="none", label=label)
-            # model colors are encoded in labels; green/red encode KGW class.
-        ax.axvline(0, color="black", linewidth=.8)
-        ax.set_title(f"Layer {layer - 1} → {layer}: per-position movement")
-        ax.set_xlabel("projected logit movement")
-        ax.set_ylabel("count")
-        ax.grid(alpha=.2); ax.legend(fontsize=8, ncol=2)
-    fig.suptitle("Distribution of KGW green/red logit-lens movement")
+            ax = axes[row, model]
+            sample = np.asarray(movements[model, layer, "all"][0] + movements[model, layer, "all"][1], dtype=float)
+            sample = sample[np.isfinite(sample)]
+            if sample.size:
+                ax.hist(sample, bins=bins, color="#64748b" if model == 0 else "#f97316", alpha=.72, edgecolor="white")
+            ax.axvline(0, color="black", linewidth=.8)
+            ax.set_title(f"{name}: layer {layer - 1} → {layer}")
+            ax.set_xlabel("logit movement")
+            ax.set_ylabel("count")
+            ax.grid(alpha=.2)
+    fig.suptitle("All matched-token logit-lens movement distributions")
     fig.tight_layout()
-    hist_path = out / "kgw_group_movement_histograms.png"
+    hist_path = out / "kgw_all_token_movement_histograms.png"
     fig.savefig(hist_path, dpi=170, bbox_inches="tight"); plt.close(fig)
 
-    # Direct final-transition green/red gap distribution, which is often the
-    # clearest single view of a KGW-style split.
+    # Optional diagnostic: overlay green/red distributions only for the final
+    # transition, with base and watermarked panels side by side.
     final = layers - 1
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
     for model, name in enumerate(model_names):
-        g = grouped[model]["green"][final] - grouped[model]["green"][final - 1]
-        r = grouped[model]["red"][final] - grouped[model]["red"][final - 1]
-        gap = g - r
-        gap = gap[np.isfinite(gap)]
-        if gap.size:
-            ax.hist(gap, bins=bins, alpha=.45, label=f"{name} green movement − red movement")
-    ax.axvline(0, color="black", linewidth=.8)
-    ax.set_title(f"Final transition ({final - 1} → {final}) green-minus-red movement")
-    ax.set_xlabel("Δgreen − Δred"); ax.set_ylabel("count"); ax.grid(alpha=.2); ax.legend()
+        ax = axes[model]
+        for group, color in (("green", "#16a34a"), ("red", "#dc2626")):
+            sample = np.asarray(movements[model, final, group][0] + movements[model, final, group][1], dtype=float)
+            sample = sample[np.isfinite(sample)]
+            if sample.size:
+                ax.hist(sample, bins=bins, alpha=.52, color=color, label=f"{group} (n={sample.size})")
+        ax.axvline(0, color="black", linewidth=.8)
+        ax.set_title(f"{name}: final transition {final - 1} → {final}")
+        ax.set_xlabel("logit movement"); ax.grid(alpha=.2); ax.legend()
+    axes[0].set_ylabel("count")
+    fig.suptitle("Final transition split by KGW red/green class")
     fig.tight_layout()
     gap_path = out / "kgw_final_green_red_movement_gap.png"
     fig.savefig(gap_path, dpi=170, bbox_inches="tight"); plt.close(fig)
@@ -278,6 +299,7 @@ def main():
     all_sets = build_green_sets(encoded, tokenizer, int(metadata["model_a"]["vocab_size"]), args.kgw_gamma, scheme)
     green_sets = select_masks(all_sets, len(all_sets), len(token_ids))
     grouped = group_arrays(ids, logits, green_sets, top_k)
+    movements = token_movements(ids, logits, green_sets, prompt_index, top_k)
     model_b_source = metadata.get("model_b", {}).get("source", "k1")
     model_b_name = "k1" if "-k1-" in model_b_source else ("k0" if "-k0-" in model_b_source else "watermarked")
     model_names = ("base", model_b_name)
@@ -285,7 +307,7 @@ def main():
     out = Path(args.output_dir) if args.output_dir else source / "kgw_group_analysis"
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "kgw_group_layer_summary.csv", rows)
-    plot_paths = make_plots(out, grouped, prompt_index, model_names, args.last_transitions, args.bins)
+    plot_paths = make_plots(out, grouped, movements, prompt_index, model_names, args.last_transitions, args.bins)
     np.savez_compressed(out / "kgw_group_metrics.npz",
                         green=np.stack([grouped[0]["green"], grouped[1]["green"]]),
                         red=np.stack([grouped[0]["red"], grouped[1]["red"]]),
