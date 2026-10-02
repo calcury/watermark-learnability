@@ -34,7 +34,6 @@ from itertools import chain
 from typing import Optional
 
 import datasets
-import evaluate
 import torch
 from datasets import load_dataset
 
@@ -51,13 +50,35 @@ from transformers import (
     Trainer,
     TrainingArguments,
     default_data_collator,
-    is_torch_tpu_available,
     set_seed,
 )
+
+# Transformers moved/renamed the TPU availability helper across releases.
+try:
+    from transformers import is_torch_tpu_available
+except ImportError:
+    try:
+        from transformers.utils import is_torch_tpu_available
+    except ImportError:
+        try:
+            from transformers.utils import is_torch_xla_available as is_torch_tpu_available
+        except ImportError:
+            def is_torch_tpu_available():
+                return False
+
 from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
+try:
+    from transformers.utils import check_min_version
+except ImportError:
+    def check_min_version(*args, **kwargs):
+        return None
+try:
+    from transformers.utils import send_example_telemetry
+except ImportError:
+    def send_example_telemetry(*args, **kwargs):
+        return None
 
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
@@ -742,6 +763,7 @@ def main():
                 train_dataset = train_dataset.select(range(max_train_samples))
 
     if training_args.do_eval:
+        import evaluate
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = lm_datasets["validation"]
