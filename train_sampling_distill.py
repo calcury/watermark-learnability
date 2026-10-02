@@ -256,6 +256,10 @@ class DataTrainingArguments:
 @dataclass
 class SamplingDistillTrainingArguments(TrainingArguments):
     """Add custom training arguments for sampling-based distillation."""
+    overwrite_output_dir: bool = field(
+        default=False,
+        metadata={"help": "Overwrite the output directory if it exists and is non-empty."},
+    )
     save_checkpoint_models: bool = field(
         default=False,
         metadata={"help": "Save model at every checkpoint, no deletion, no optimizer states."},
