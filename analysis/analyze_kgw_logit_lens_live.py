@@ -97,6 +97,11 @@ def make_masks(tokenizer, prompts, vocab_size, gamma, scheme, max_tokens):
     watermark = WatermarkBase(vocab=list(range(vocab_size)), gamma=gamma,
                               seeding_scheme=scheme, device="cpu")
     import torch as torch_local
+    special_ids = set()
+    if scheme == "simple_1":
+        special_ids = {int(x) for x in (tokenizer.eos_token_id, tokenizer.bos_token_id,
+                                         tokenizer.pad_token_id, tokenizer.unk_token_id)
+                       if x is not None and 0 <= int(x) < vocab_size}
     masks = []
     prompt_index = []
     for prompt_id, ids in enumerate(encoded["input_ids"]):
@@ -105,10 +110,14 @@ def make_masks(tokenizer, prompts, vocab_size, gamma, scheme, max_tokens):
             context = ids[:position + 1]
             if len(context) < watermark.context_width:
                 masks.append(np.zeros(vocab_size, dtype=bool))
+            elif scheme == "simple_1" and int(context[-1]) in special_ids:
+                masks.append(np.zeros(vocab_size, dtype=bool))
             else:
                 green = watermark._get_greenlist_ids(torch_local.as_tensor(context, dtype=torch_local.long)).tolist()
                 mask = np.zeros(vocab_size, dtype=bool)
                 mask[np.asarray(green, dtype=np.int64)] = True
+                if special_ids:
+                    mask[list(special_ids)] = False
                 masks.append(mask)
             prompt_index.append(prompt_id)
     masks = np.asarray(masks, dtype=bool)
@@ -136,6 +145,25 @@ def collect_hidden(model_source, encoded_batches, token, device, trust_remote_co
         kw["torch_dtype"] = torch.float32
     model = AutoModelForCausalLM.from_pretrained(model_source, **kw)
     model.eval()
+    norm_module = next(x for x in [getattr(getattr(model, "model", None), "norm", None),
+                                   getattr(getattr(model, "transformer", None), "ln_f", None),
+                                   getattr(getattr(model, "gpt_neox", None), "final_layer_norm", None)] if x is not None)
+    head_module = model.get_output_embeddings()
+    captured = {"norm_weight": None, "norm_bias": None, "head_weight": None, "head_bias": None}
+
+    def capture_norm(module, inputs):
+        captured["norm_weight"] = module.weight.detach().float().cpu().clone()
+        bias = getattr(module, "bias", None)
+        captured["norm_bias"] = bias.detach().float().cpu().clone() if bias is not None else None
+
+    def capture_head(module, inputs):
+        if captured["head_weight"] is None:
+            captured["head_weight"] = module.weight.detach().float().cpu().clone()
+            bias = getattr(module, "bias", None)
+            captured["head_bias"] = bias.detach().float().cpu().clone() if bias is not None else None
+
+    norm_hook = norm_module.register_forward_pre_hook(capture_norm)
+    head_hook = head_module.register_forward_pre_hook(capture_head)
     chunks = None
     with torch.inference_mode():
         for batch in encoded_batches:
@@ -148,8 +176,13 @@ def collect_hidden(model_source, encoded_batches, token, device, trust_remote_co
             for layer, state in enumerate(output.hidden_states):
                 chunks[layer].append(state[valid].float().cpu())
             del output, inputs
+    norm_hook.remove()
+    head_hook.remove()
     if chunks is None:
         raise ValueError("No hidden states collected")
+    if captured["norm_weight"] is None or captured["head_weight"] is None:
+        raise RuntimeError("Could not capture final norm/lm_head weights during model forward")
+    model._logit_lens_projection_weights = captured
     hidden = [torch.cat(x).numpy() for x in chunks]
     if hidden[0].shape[0] > max_tokens:
         indices = np.linspace(0, hidden[0].shape[0] - 1, max_tokens, dtype=np.int64)
@@ -167,20 +200,29 @@ def selected_layers(spec, count):
 
 
 def project_model(model, hidden, layers, masks, hist_samples, bins, rng):
-    norm = next(x for x in [getattr(getattr(model, "model", None), "norm", None),
-                            getattr(getattr(model, "transformer", None), "ln_f", None),
-                            getattr(getattr(model, "gpt_neox", None), "final_layer_norm", None)] if x is not None)
-    head = model.get_output_embeddings()
-    norm_param, head_param = next(norm.parameters()), next(head.parameters())
-    norm_device, norm_dtype = norm_param.device, norm_param.dtype
-    head_device, head_dtype = head_param.device, head_param.dtype
-    vocab = int(head.out_features)
+    import torch.nn.functional as F
+    weights = model._logit_lens_projection_weights
+    norm_weight = weights["norm_weight"]
+    norm_bias = weights["norm_bias"]
+    head_weight = weights["head_weight"]
+    head_bias = weights["head_bias"]
+    config = model.config
+    norm_type = getattr(config, "rms_norm_eps", None)
+    eps = float(norm_type if norm_type is not None else getattr(config, "layer_norm_eps", 1e-5))
+    vocab = int(head_weight.shape[0])
     rows = []
     samples = {}
     for layer in layers:
         with torch.inference_mode():
-            h = torch.from_numpy(hidden[layer]).to(device=norm_device, dtype=norm_dtype)
-            projected = head(norm(h).to(device=head_device, dtype=head_dtype)).float()
+            h = torch.from_numpy(hidden[layer]).float()
+            nw = norm_weight.to(dtype=torch.float32)
+            if norm_bias is None:
+                # Llama RMSNorm: divide by RMS, then multiply learned scale.
+                normalized = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps) * nw
+            else:
+                # LayerNorm-style final normalization (e.g. GPT-NeoX).
+                normalized = F.layer_norm(h, (h.shape[-1],), nw, norm_bias, eps)
+            projected = F.linear(normalized, head_weight, head_bias)
             values = projected.detach().cpu().numpy()
         flat = values.reshape(-1)
         flat_mask = np.broadcast_to(masks, values.shape)
