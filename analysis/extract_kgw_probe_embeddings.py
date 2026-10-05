@@ -141,6 +141,8 @@ def main():
     if not labels:
         raise RuntimeError("No labelled positions; increase --max-length or lower --min-context")
     labels_np = np.asarray(labels, dtype=np.int64)
+    raw_count = int(len(labels_np))
+    raw_green_count = int(labels_np.sum())
     if args.balance:
         rng = np.random.default_rng(args.seed)
         green = np.flatnonzero(labels_np == 1)
@@ -160,7 +162,12 @@ def main():
             "gamma": args.gamma, "seeding_scheme": scheme,
             "context_width": detector.context_width, "balanced": args.balance,
             "max_new_tokens": args.max_new_tokens, "temperature": args.temperature,
-            "top_p": args.top_p, "count": int(len(labels_np)),
+            "top_p": args.top_p, "raw_count": raw_count,
+            "raw_green_count": raw_green_count,
+            "raw_green_fraction": (raw_green_count / raw_count if raw_count else None),
+            "count": int(len(labels_np)),
+            "green_count": int(labels_np.sum()),
+            "green_fraction": float(labels_np.mean()),
             "layers": len(rows_by_layer), "generated_prompt_count": len(generation_records),
         },
     }
