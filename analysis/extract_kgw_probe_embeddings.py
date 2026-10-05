@@ -28,7 +28,8 @@ from watermarks.kgw.watermark_processor import WatermarkDetector
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", required=True,
+                   help="Llama-2/Pythia model ID or local checkpoint")
     p.add_argument("--texts", required=True, help="UTF-8 file, one text/prompt per line")
     p.add_argument("--output", required=True, help="Output .pt file")
     p.add_argument("--k", type=int, choices=(0, 1, 2), required=True)
@@ -36,6 +37,11 @@ def parse_args():
     p.add_argument("--gamma", type=float, default=0.25)
     p.add_argument("--seeding-scheme", default=None)
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    p.add_argument("--trust-remote-code", action="store_true")
+    p.add_argument("--load-in-8bit", action="store_true",
+                   help="Use bitsandbytes 8-bit loading (useful for Llama-2-7B)")
+    p.add_argument("--load-in-4bit", action="store_true",
+                   help="Use bitsandbytes 4-bit loading (lowest VRAM; requires bitsandbytes)")
     p.add_argument("--batch-size", type=int, default=1,
                    help="Kept for CLI compatibility; generation is prompt-by-prompt")
     p.add_argument("--max-length", type=int, default=256,
@@ -68,12 +74,27 @@ def main():
     texts = [x.strip() for x in Path(args.texts).read_text(encoding="utf-8").splitlines() if x.strip()]
     if not texts:
         raise ValueError("--texts contains no non-empty lines")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, use_fast=True, trust_remote_code=args.trust_remote_code
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    dtype = torch.float16 if device == "cuda" else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
-    model.to(device).eval()
+    # Llama-2 has no pad token by default; left padding is not used, but an
+    # explicit pad token avoids generation warnings and keeps attention masks valid.
+    tokenizer.padding_side = "right"
+    load_kwargs = {"trust_remote_code": args.trust_remote_code}
+    if args.load_in_4bit or args.load_in_8bit:
+        if device != "cuda":
+            raise RuntimeError("--load-in-4bit/8bit requires --device cuda")
+        load_kwargs["device_map"] = "auto"
+        load_kwargs["load_in_4bit"] = args.load_in_4bit
+        load_kwargs["load_in_8bit"] = args.load_in_8bit
+    else:
+        load_kwargs["torch_dtype"] = torch.float16 if device == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    if not (args.load_in_4bit or args.load_in_8bit):
+        model.to(device)
+    model.eval()
     scheme = args.seeding_scheme or f"simple_{args.k}"
     detector = WatermarkDetector(
         vocab=list(tokenizer.get_vocab().values()), gamma=args.gamma,

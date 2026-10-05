@@ -31,6 +31,9 @@ def parse_args():
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    p.add_argument("--trust-remote-code", action="store_true")
+    p.add_argument("--load-in-8bit", action="store_true")
+    p.add_argument("--load-in-4bit", action="store_true")
     return p.parse_args()
 
 
@@ -46,11 +49,23 @@ def main():
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
     set_seed(args.seed)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, use_fast=True, trust_remote_code=args.trust_remote_code
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype="auto")
-    model.to(device).eval()
+    load_kwargs = {"trust_remote_code": args.trust_remote_code}
+    if args.load_in_4bit or args.load_in_8bit:
+        if device != "cuda":
+            raise RuntimeError("--load-in-4bit/8bit requires --device cuda")
+        load_kwargs.update({"device_map": "auto", "load_in_4bit": args.load_in_4bit,
+                            "load_in_8bit": args.load_in_8bit})
+    else:
+        load_kwargs["torch_dtype"] = "auto"
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    if not (args.load_in_4bit or args.load_in_8bit):
+        model.to(device)
+    model.eval()
     detector = WatermarkDetector(
         vocab=list(range(len(tokenizer))), gamma=args.gamma,
         seeding_scheme=scheme, tokenizer=tokenizer, device=torch.device("cpu"),
