@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--generations-output", default=None,
                    help="Optional JSONL file saving each prompt and generated continuation")
+    p.add_argument("--input-generations", default=None,
+                   help="Reuse an existing generations JSONL and skip model.generate")
     return p.parse_args()
 
 
@@ -113,32 +115,47 @@ def main():
     processed = 0
     generation_records = []
     generation_path = Path(args.generations_output) if args.generations_output else None
+    input_generation_path = Path(args.input_generations) if args.input_generations else None
+    if input_generation_path:
+        generation_records = [json.loads(line) for line in input_generation_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not generation_records:
+            raise ValueError(f"No records found in {input_generation_path}")
+        prompts_to_process = generation_records
+    else:
+        prompts_to_process = [{"prompt_index": i, "prompt": p} for i, p in enumerate(texts)]
     with torch.inference_mode():
-        for index, prompt in enumerate(texts):
+        for index, record in enumerate(prompts_to_process):
+            prompt = record["prompt"]
             enc = tokenizer(prompt, return_tensors="pt", truncation=True,
                             max_length=args.max_length)
             prompt_ids = enc["input_ids"].to(device)
             prompt_mask = enc["attention_mask"].to(device)
-            generated = model.generate(
-                input_ids=prompt_ids, attention_mask=prompt_mask,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=not args.greedy,
-                temperature=max(args.temperature, 1e-5),
-                top_p=args.top_p,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+            if input_generation_path:
+                continuation_ids = tokenizer(record["continuation"], add_special_tokens=False,
+                                             return_tensors="pt")["input_ids"].to(device)
+                generated = torch.cat([prompt_ids, continuation_ids], dim=1)
+            else:
+                generated = model.generate(
+                    input_ids=prompt_ids, attention_mask=prompt_mask,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=not args.greedy,
+                    temperature=max(args.temperature, 1e-5),
+                    top_p=args.top_p,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
             # Analyze the complete prompt+continuation sequence. Prompt positions are
             # retained as context, but only continuation-token labels are collected.
             prompt_len = int(prompt_mask[0].sum())
             ids = generated[0].detach().cpu()
             continuation = ids[prompt_len:]
-            generation_records.append({
-                "prompt_index": index,
-                "prompt": prompt,
-                "continuation": tokenizer.decode(continuation, skip_special_tokens=True),
-                "prompt_tokens": prompt_len,
-                "generated_tokens": int(len(continuation)),
-            })
+            if not input_generation_path:
+                generation_records.append({
+                    "prompt_index": index,
+                    "prompt": prompt,
+                    "continuation": tokenizer.decode(continuation, skip_special_tokens=True),
+                    "prompt_tokens": prompt_len,
+                    "generated_tokens": int(len(continuation)),
+                })
             out = model(input_ids=generated, output_hidden_states=True, return_dict=True)
             if layers is None:
                 layers = len(out.hidden_states)
@@ -158,12 +175,14 @@ def main():
             print(f"processed prompts {index + 1}/{len(texts)}; points={processed}")
             if args.max_points and processed >= args.max_points:
                 break
-    if generation_path:
+    if generation_path and not input_generation_path:
         generation_path.parent.mkdir(parents=True, exist_ok=True)
         with generation_path.open("w", encoding="utf-8") as handle:
             for record in generation_records:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         print(f"saved generations: {generation_path}")
+    elif input_generation_path:
+        print(f"reused generations: {input_generation_path}")
     if not labels:
         raise RuntimeError("No labelled positions; increase --max-length or lower --min-context")
     labels_np = np.asarray(labels, dtype=np.int64)
