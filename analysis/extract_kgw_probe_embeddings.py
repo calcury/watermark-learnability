@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Extract per-layer causal hidden states labelled by KGW green/red membership.
+
+Each row is the hidden state at position t (the representation used to predict
+input token t+1). The label is whether input token t+1 belongs to the KGW
+ green-list seeded by the prefix ending at input token t.
+
+Example:
+  python analysis/extract_kgw_probe_embeddings.py \
+    --model pretrained/pythia-1.4b-sampling-watermark-distill-kgw-k0-gamma0.25-delta2 \
+    --texts data/prompts.txt --output analysis/kgw_probe_k0_d2.pt --k 0 --delta 2
+"""
+import argparse
+import json
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from watermarks.kgw.watermark_processor import WatermarkDetector
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--model", required=True)
+    p.add_argument("--texts", required=True, help="UTF-8 file, one text/prompt per line")
+    p.add_argument("--output", required=True, help="Output .pt file")
+    p.add_argument("--k", type=int, choices=(0, 1, 2), required=True)
+    p.add_argument("--delta", type=int, choices=(1, 2), default=2)
+    p.add_argument("--gamma", type=float, default=0.25)
+    p.add_argument("--seeding-scheme", default=None)
+    p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--max-length", type=int, default=256)
+    p.add_argument("--max-points", type=int, default=100000,
+                   help="Maximum labelled positions; use 0 for unlimited")
+    p.add_argument("--min-context", type=int, default=None,
+                   help="Minimum prefix length; defaults to KGW context width")
+    p.add_argument("--balance", action="store_true",
+                   help="Keep equal numbers of green and red rows")
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
+    texts = [x.strip() for x in Path(args.texts).read_text(encoding="utf-8").splitlines() if x.strip()]
+    if not texts:
+        raise ValueError("--texts contains no non-empty lines")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
+    model.to(device).eval()
+    scheme = args.seeding_scheme or f"simple_{args.k}"
+    detector = WatermarkDetector(
+        vocab=list(range(len(tokenizer))), gamma=args.gamma,
+        seeding_scheme=scheme, tokenizer=tokenizer,
+        device=torch.device("cpu"), normalizers=[]
+    )
+    min_context = args.min_context or detector.context_width
+    layers = None
+    labels = []
+    rows_by_layer = None
+    processed = 0
+    with torch.inference_mode():
+        for start in range(0, len(texts), args.batch_size):
+            batch_texts = texts[start:start + args.batch_size]
+            enc = tokenizer(batch_texts, return_tensors="pt", padding=True,
+                            truncation=True, max_length=args.max_length)
+            ids = enc["input_ids"]
+            mask = enc["attention_mask"]
+            out = model(input_ids=ids.to(device), attention_mask=mask.to(device),
+                        output_hidden_states=True, return_dict=True)
+            # hidden_states[0] is the input embedding; subsequent entries are transformer layers.
+            if layers is None:
+                layers = len(out.hidden_states)
+                rows_by_layer = [[] for _ in range(layers)]
+            for b in range(ids.shape[0]):
+                length = int(mask[b].sum())
+                # Position t predicts token t+1; exclude padding and short prefixes.
+                for t in range(min_context - 1, length - 1):
+                    prefix = ids[b, :t + 1].cpu()
+                    target = int(ids[b, t + 1])
+                    green = detector._get_greenlist_ids(prefix)
+                    label = int(target in green.tolist())
+                    labels.append(label)
+                    for li, hidden in enumerate(out.hidden_states):
+                        rows_by_layer[li].append(hidden[b, t].detach().float().cpu())
+                    processed += 1
+                    if args.max_points and processed >= args.max_points:
+                        break
+                if args.max_points and processed >= args.max_points:
+                    break
+            print(f"processed texts {min(start + args.batch_size, len(texts))}/{len(texts)}; points={processed}")
+            if args.max_points and processed >= args.max_points:
+                break
+    if not labels:
+        raise RuntimeError("No labelled positions; increase --max-length or lower --min-context")
+    labels_np = np.asarray(labels, dtype=np.int64)
+    if args.balance:
+        rng = np.random.default_rng(args.seed)
+        green = np.flatnonzero(labels_np == 1)
+        red = np.flatnonzero(labels_np == 0)
+        n = min(len(green), len(red))
+        if n == 0:
+            raise RuntimeError("Cannot balance: only one class was observed")
+        keep = np.concatenate([rng.choice(green, n, replace=False), rng.choice(red, n, replace=False)])
+        rng.shuffle(keep)
+        labels_np = labels_np[keep]
+        rows_by_layer = [[rows[i] for i in keep] for rows in rows_by_layer]
+    payload = {
+        "embeddings": [torch.stack(rows) for rows in rows_by_layer],
+        "labels": torch.from_numpy(labels_np),
+        "metadata": {
+            "model": args.model, "k": args.k, "delta": args.delta,
+            "gamma": args.gamma, "seeding_scheme": scheme,
+            "context_width": detector.context_width, "balanced": args.balance,
+            "count": int(len(labels_np)), "layers": len(rows_by_layer),
+        },
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, output)
+    print(json.dumps(payload["metadata"], indent=2))
+    print(f"saved {output} (labels: green={int(labels_np.sum())}, red={int((labels_np == 0).sum())})")
+
+
+if __name__ == "__main__":
+    main()
