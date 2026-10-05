@@ -36,13 +36,63 @@ def load_data(path):
     return data, parts
 
 
+def save_results(prefix, args, manifest, rows):
+    prefix = Path(prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"input": args.input, "metadata": manifest.get("metadata", {}),
+               "test_size": args.test_size, "seed": args.seed, "rows": rows}
+    json_path = prefix.with_suffix(".json")
+    tmp_json = json_path.with_suffix(json_path.suffix + ".tmp")
+    tmp_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_json.replace(json_path)
+    csv_path = prefix.with_suffix(".csv")
+    tmp_csv = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with tmp_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
+    tmp_csv.replace(csv_path)
+    try:
+        import matplotlib.pyplot as plt
+        layers = [r["layer"] for r in rows]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        axes[0].plot(layers, [r["accuracy"] for r in rows], marker="o", label="test")
+        axes[0].plot(layers, [r["train_accuracy"] for r in rows], marker=".", alpha=.6, label="train")
+        axes[0].axhline(.5, color="gray", ls="--"); axes[0].set_ylim(0, 1); axes[0].legend()
+        axes[0].set(xlabel="Layer (0 = embedding)", ylabel="Accuracy", title="KGW linear probe")
+        axes[1].plot(layers, [r["p_value"] for r in rows], marker="o")
+        axes[1].axhline(.05, color="gray", ls="--"); axes[1].set_yscale("log")
+        axes[1].set(xlabel="Layer", ylabel="One-sided binomial p-value", title="Test accuracy significance")
+        fig.tight_layout(); fig.savefig(prefix.with_suffix(".png"), dpi=180); plt.close(fig)
+    except ImportError:
+        pass
+
+
 def main():
     args = parse_args()
     manifest, parts = load_data(args.input)
     n_layers = len(parts[0]["embeddings"])
     rng = np.random.default_rng(args.seed)
+    prefix = Path(args.output_prefix)
     rows = []
+    existing_json = prefix.with_suffix(".json")
+    if existing_json.exists():
+        try:
+            previous = json.loads(existing_json.read_text(encoding="utf-8"))
+            compatible = (previous.get("input") == args.input and
+                          previous.get("seed") == args.seed and
+                          float(previous.get("test_size", args.test_size)) == args.test_size)
+            if compatible:
+                rows = sorted(previous.get("rows", []), key=lambda r: int(r["layer"]))
+                print(f"resuming: found {len(rows)} completed layer(s)", flush=True)
+            else:
+                print("existing result parameters differ; starting from layer 0", flush=True)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"could not read existing results ({exc}); starting over", flush=True)
+    completed = {int(row["layer"]) for row in rows}
     for layer in range(n_layers):
+        if layer in completed:
+            print(f"layer={layer:>2} already saved; skipping", flush=True)
+            continue
         x = torch.cat([p["embeddings"][layer] for p in parts], dim=0).numpy().astype(np.float32, copy=False)
         y = torch.cat([p["labels"] for p in parts], dim=0).numpy().astype(np.int64, copy=False)
         if args.max_points and len(y) > args.max_points:
@@ -64,32 +114,14 @@ def main():
                "train_accuracy": float(accuracy_score(y_train, train_pred)),
                "accuracy": acc, "correct": correct, "chance": 0.5,
                "p_value": p_value, "log10_p_value": float(np.log10(max(p_value, 1e-300)))}
+        rows = [r for r in rows if int(r["layer"]) != layer]
         rows.append(row)
-        print(f"layer={layer:>2} train={row['train_accuracy']:.4f} test={acc:.4f} p={p_value:.4g}", flush=True)
-    prefix = Path(args.output_prefix)
-    prefix.parent.mkdir(parents=True, exist_ok=True)
-    csv_path = prefix.with_suffix(".csv")
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
-    json_path = prefix.with_suffix(".json")
-    metadata = manifest.get("metadata", {})
-    json_path.write_text(json.dumps({"input": args.input, "metadata": metadata,
-                                     "test_size": args.test_size, "seed": args.seed, "rows": rows}, indent=2), encoding="utf-8")
-    try:
-        import matplotlib.pyplot as plt
-        layers = [r["layer"] for r in rows]
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-        axes[0].plot(layers, [r["accuracy"] for r in rows], marker="o", label="test")
-        axes[0].plot(layers, [r["train_accuracy"] for r in rows], marker=".", alpha=.6, label="train")
-        axes[0].axhline(.5, color="gray", ls="--"); axes[0].set_ylim(0, 1); axes[0].legend()
-        axes[0].set(xlabel="Layer (0 = embedding)", ylabel="Accuracy", title="KGW linear probe")
-        axes[1].plot(layers, [r["p_value"] for r in rows], marker="o")
-        axes[1].axhline(.05, color="gray", ls="--"); axes[1].set_yscale("log")
-        axes[1].set(xlabel="Layer", ylabel="One-sided binomial p-value", title="Test accuracy significance")
-        fig.tight_layout(); fig.savefig(prefix.with_suffix(".png"), dpi=180); plt.close(fig)
-    except ImportError:
-        print("matplotlib unavailable; CSV and JSON were still written")
-    print(f"saved {csv_path}\nsaved {json_path}")
+        rows.sort(key=lambda r: int(r["layer"]))
+        save_results(prefix, args, manifest, rows)
+        print(f"saved checkpoint through layer {layer}", flush=True)
+    if rows:
+        save_results(prefix, args, manifest, rows)
+    print(f"saved incremental results: {prefix.with_suffix('.csv')} and {prefix.with_suffix('.json')}")
 
 
 if __name__ == "__main__":
