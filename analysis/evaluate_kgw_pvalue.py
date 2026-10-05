@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 
 import torch
 from scipy.stats import binom
-from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
 
 from watermarks.kgw.watermark_processor import WatermarkDetector
 
@@ -58,8 +58,16 @@ def main():
     if args.load_in_4bit or args.load_in_8bit:
         if device != "cuda":
             raise RuntimeError("--load-in-4bit/8bit requires --device cuda")
-        load_kwargs.update({"device_map": "auto", "load_in_4bit": args.load_in_4bit,
-                            "load_in_8bit": args.load_in_8bit})
+        load_kwargs.update({
+            "device_map": "auto",
+            "quantization_config": BitsAndBytesConfig(
+                load_in_4bit=args.load_in_4bit,
+                load_in_8bit=args.load_in_8bit,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            ),
+        })
     else:
         load_kwargs["torch_dtype"] = "auto"
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)

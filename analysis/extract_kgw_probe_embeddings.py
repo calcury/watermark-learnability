@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -87,8 +87,13 @@ def main():
         if device != "cuda":
             raise RuntimeError("--load-in-4bit/8bit requires --device cuda")
         load_kwargs["device_map"] = "auto"
-        load_kwargs["load_in_4bit"] = args.load_in_4bit
-        load_kwargs["load_in_8bit"] = args.load_in_8bit
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=args.load_in_4bit,
+            load_in_8bit=args.load_in_8bit,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
     else:
         load_kwargs["torch_dtype"] = torch.float16 if device == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
