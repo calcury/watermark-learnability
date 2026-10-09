@@ -46,6 +46,8 @@ parser.add_argument("--output_train_file", type=str, required=True)
 parser.add_argument("--overwrite_output_file", action="store_true", default=False)
 parser.add_argument("--fp16", action="store_true", default=False)
 parser.add_argument("--watermark_config_file", type=str, required=True)
+parser.add_argument("--delta", type=int, choices=(1, 2), default=2,
+                    help="Expected KGW bias/config delta (default: 2); must match the supplied config")
 parser.add_argument("--save_interval", type=int, default=64000)
 parser.add_argument("--dataloader_batch_size", type=int, default=10000)
 
@@ -159,6 +161,12 @@ if samples_dict:
 
 with open(args.watermark_config_file, "r") as f:
     watermark_config = json.load(f)
+if (watermark_config.get("type") == WatermarkType.KGW
+        and float(watermark_config.get("delta", -1)) != float(args.delta)):
+    raise ValueError(
+        f"Selected KGW config has delta={watermark_config.get('delta')} but --delta={args.delta}; "
+        "pass a matching --watermark_config_file or correct --delta."
+    )
 
 
 output_dict = {

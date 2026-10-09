@@ -24,6 +24,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 import json
+import inspect
 import logging
 import math
 import os
@@ -33,11 +34,12 @@ from itertools import chain
 from typing import Optional
 
 import datasets
-import evaluate
 import torch
 from datasets import load_dataset
 
 import transformers
+import torch.nn.functional as F
+from watermarks.kgw.watermark_processor import WatermarkBase
 from transformers import (
     CONFIG_MAPPING,
     MODEL_FOR_CAUSAL_LM_MAPPING,
@@ -48,13 +50,35 @@ from transformers import (
     Trainer,
     TrainingArguments,
     default_data_collator,
-    is_torch_tpu_available,
     set_seed,
 )
+
+# Transformers moved/renamed the TPU availability helper across releases.
+try:
+    from transformers import is_torch_tpu_available
+except ImportError:
+    try:
+        from transformers.utils import is_torch_tpu_available
+    except ImportError:
+        try:
+            from transformers.utils import is_torch_xla_available as is_torch_tpu_available
+        except ImportError:
+            def is_torch_tpu_available():
+                return False
+
 from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
+try:
+    from transformers.utils import check_min_version
+except ImportError:
+    def check_min_version(*args, **kwargs):
+        return None
+try:
+    from transformers.utils import send_example_telemetry
+except ImportError:
+    def send_example_telemetry(*args, **kwargs):
+        return None
 
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
@@ -232,6 +256,10 @@ class DataTrainingArguments:
 @dataclass
 class SamplingDistillTrainingArguments(TrainingArguments):
     """Add custom training arguments for sampling-based distillation."""
+    overwrite_output_dir: bool = field(
+        default=False,
+        metadata={"help": "Overwrite the output directory if it exists and is non-empty."},
+    )
     save_checkpoint_models: bool = field(
         default=False,
         metadata={"help": "Save model at every checkpoint, no deletion, no optimizer states."},
@@ -240,9 +268,130 @@ class SamplingDistillTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Watermark config file to save with model."},
     )
+    alignment_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for centered-cosine KGW alignment loss; 0 disables it."},
+    )
+    alignment_reference_model: Optional[str] = field(
+        default=None,
+        metadata={"help": "Frozen clean reference model used to define student logit delta."},
+    )
+    alignment_reference_device: str = field(
+        default="cpu",
+        metadata={"help": "Device for the frozen reference model (cpu/cuda); CPU saves VRAM."},
+    )
+    alignment_positions_per_sequence: int = field(
+        default=8,
+        metadata={"help": "Maximum evenly spaced token positions per sequence used for KGW alignment."},
+    )
 
 
 class SamplingDistillTrainer(Trainer):
+    def __init__(self, *args, alignment_loss_weight=0.0, alignment_reference_model=None,
+                 alignment_positions_per_sequence=8, kgw_gamma=0.25,
+                 kgw_seeding_scheme="simple_1", **kwargs):
+        trainer_init_params = inspect.signature(Trainer.__init__).parameters
+        alignment_tokenizer = kwargs.pop("tokenizer", None)
+        if alignment_tokenizer is not None:
+            tokenizer_arg = "processing_class" if "processing_class" in trainer_init_params else "tokenizer"
+            kwargs[tokenizer_arg] = alignment_tokenizer
+        super().__init__(*args, **kwargs)
+        self.alignment_tokenizer = alignment_tokenizer or getattr(
+            self, "processing_class", getattr(self, "tokenizer", None))
+        self.alignment_loss_weight = float(alignment_loss_weight)
+        self.alignment_reference_model = alignment_reference_model
+        self.alignment_positions_per_sequence = max(1, int(alignment_positions_per_sequence))
+        self.kgw_gamma = float(kgw_gamma)
+        self.kgw_seeding_scheme = kgw_seeding_scheme
+        self._alignment_microsteps = 0
+        self.kgw_mask_builder = None
+        if self.alignment_loss_weight > 0:
+            if self.alignment_reference_model is None:
+                raise ValueError("alignment loss requires --alignment_reference_model")
+            if self.args.watermark_config_file is None:
+                raise ValueError("alignment loss requires --watermark_config_file")
+            self.alignment_reference_model.eval()
+            self.alignment_reference_model.requires_grad_(False)
+            self.kgw_mask_builder = WatermarkBase(
+                vocab=list(range(len(self.alignment_tokenizer))), gamma=self.kgw_gamma,
+                seeding_scheme=self.kgw_seeding_scheme, device="cpu")
+            if self.kgw_mask_builder.self_salt:
+                raise ValueError("alignment loss currently supports non-self-salted KGW schemes only")
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.alignment_loss_weight <= 0:
+            if "num_items_in_batch" in inspect.signature(super().compute_loss).parameters:
+                return super().compute_loss(model, inputs, return_outputs,
+                                            num_items_in_batch=num_items_in_batch)
+            return super().compute_loss(model, inputs, return_outputs)
+
+        labels = inputs.get("labels")
+        model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
+        outputs = model(**model_inputs, use_cache=False)
+        if labels is None:
+            raise ValueError("Sampling dataset batch is missing labels")
+        shift_logits = outputs.logits[:, :-1, :].float()
+        shift_labels = labels[:, 1:]
+        valid = shift_labels.ne(-100) & model_inputs["attention_mask"][:, 1:].bool()
+        ce_loss = F.cross_entropy(shift_logits.reshape(-1, shift_logits.size(-1)),
+                                  shift_labels.reshape(-1), ignore_index=-100)
+
+        ref_device = next(self.alignment_reference_model.parameters()).device
+        with torch.no_grad():
+            ref_outputs = self.alignment_reference_model(
+                **{k: v.to(ref_device) for k, v in model_inputs.items()}, use_cache=False)
+            ref_logits = ref_outputs.logits[:, :-1, :].to(device=shift_logits.device, dtype=torch.float32)
+        if ref_logits.shape != shift_logits.shape:
+            raise ValueError("Reference and student logits have different shapes")
+
+        alignment_vocab_size = len(self.alignment_tokenizer)
+        if alignment_vocab_size > shift_logits.shape[-1]:
+            raise ValueError("Tokenizer has more IDs than the model logit head")
+        input_ids = model_inputs["input_ids"]
+        cosine_values = []
+        logit_vocab_size = shift_logits.shape[-1]
+        for batch_idx in range(input_ids.shape[0]):
+            positions = [pos for pos in range(1, input_ids.shape[1])
+                         if valid[batch_idx, pos - 1]
+                         and pos >= self.kgw_mask_builder.context_width]
+            if len(positions) > self.alignment_positions_per_sequence:
+                selected = torch.linspace(0, len(positions) - 1,
+                                          steps=self.alignment_positions_per_sequence).round().long().tolist()
+                positions = [positions[index] for index in selected]
+            for pos in positions:
+                context = input_ids[batch_idx, :pos]
+                green_ids = self.kgw_mask_builder._get_greenlist_ids(context.detach().cpu()).to(shift_logits.device)
+                delta = shift_logits[batch_idx, pos - 1] - ref_logits[batch_idx, pos - 1]
+                centered_delta = delta - delta.mean()
+                delta_norm = centered_delta.norm()
+                # At initialization student and reference can be identical. Cosine
+                # has no meaningful direction there, so skip this position safely.
+                if delta_norm.detach().item() < 1e-6:
+                    continue
+                green_count = green_ids.numel()
+                mask_norm = math.sqrt(green_count * (1.0 - self.kgw_gamma) ** 2
+                                      + (logit_vocab_size - green_count) * self.kgw_gamma ** 2)
+                # For a centered delta, dot(delta, green_mask - gamma) equals
+                # sum(delta[green_ids]); avoid materializing a batch×time×vocab mask.
+                numerator = centered_delta.index_select(0, green_ids).sum()
+                cosine_values.append(numerator / (delta_norm * mask_norm).clamp_min(1e-8))
+        if cosine_values:
+            alignment_loss = (1.0 - torch.stack(cosine_values)).mean()
+        else:
+            # The student can initially equal the clean reference exactly, so
+            # this batch has no defined cosine direction. Let CE move it first.
+            alignment_loss = shift_logits.sum() * 0.0
+        loss = ce_loss + self.alignment_loss_weight * alignment_loss
+        self._alignment_microsteps += 1
+        if self._alignment_microsteps % max(1, self.args.logging_steps) == 0:
+            self.log({"ce_loss": float(ce_loss.detach().cpu()),
+                      "alignment_loss": float(alignment_loss.detach().cpu()),
+                      "weighted_alignment_loss": float((self.alignment_loss_weight * alignment_loss).detach().cpu())})
+        outputs.loss = loss
+        outputs.alignment_loss = alignment_loss.detach()
+        outputs.ce_loss = ce_loss.detach()
+        return (loss, outputs) if return_outputs else loss
+
     def _save_checkpoint(self, *args, **kwargs):
         """
         If self.args.save_checkpoint_models is True, save model at every checkpoint, no optimizer states.
@@ -343,7 +492,7 @@ def main():
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=True if model_args.use_auth_token else None,
             streaming=data_args.streaming,
         )
         if "validation" not in raw_datasets.keys() and not data_args.streaming:
@@ -352,7 +501,7 @@ def main():
                 data_args.dataset_config_name,
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=True if model_args.use_auth_token else None,
                 streaming=data_args.streaming,
             )
             raw_datasets["train"] = load_dataset(
@@ -360,7 +509,7 @@ def main():
                 data_args.dataset_config_name,
                 split=f"train[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=True if model_args.use_auth_token else None,
                 streaming=data_args.streaming,
             )
     else:
@@ -382,7 +531,7 @@ def main():
             extension,
             data_files=data_files,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=True if model_args.use_auth_token else None,
             **dataset_args,
         )
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
@@ -392,7 +541,7 @@ def main():
                 data_files=data_files,
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=True if model_args.use_auth_token else None,
                 **dataset_args,
             )
             raw_datasets["train"] = load_dataset(
@@ -400,7 +549,7 @@ def main():
                 data_files=data_files,
                 split=f"train[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=True if model_args.use_auth_token else None,
                 **dataset_args,
             )
 
@@ -416,7 +565,7 @@ def main():
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
+        "token": True if model_args.use_auth_token else None,
     }
     if model_args.config_name:
         config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
@@ -434,7 +583,7 @@ def main():
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
         "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
+        "token": True if model_args.use_auth_token else None,
     }
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
@@ -461,7 +610,7 @@ def main():
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=True if model_args.use_auth_token else None,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=model_args.low_cpu_mem_usage,
         )
@@ -469,6 +618,33 @@ def main():
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
+
+    alignment_gamma = 0.25
+    alignment_seeding_scheme = "simple_1"
+    if training_args.watermark_config_file:
+        with open(training_args.watermark_config_file, encoding="utf-8") as config_file:
+            watermark_config = json.load(config_file)
+        if watermark_config.get("type") == "kgw":
+            alignment_gamma = float(watermark_config["gamma"])
+            alignment_seeding_scheme = watermark_config["seeding_scheme"]
+    if training_args.alignment_loss_weight > 0:
+        if training_args.watermark_config_file is None:
+            raise ValueError("--watermark_config_file is required when alignment loss is enabled")
+        if not training_args.alignment_reference_model:
+            training_args.alignment_reference_model = model_args.model_name_or_path
+        if not training_args.alignment_reference_model:
+            raise ValueError("Could not infer clean alignment reference model")
+
+    alignment_reference = None
+    if training_args.alignment_loss_weight > 0:
+        alignment_reference = AutoModelForCausalLM.from_pretrained(
+            training_args.alignment_reference_model,
+            torch_dtype=torch_dtype if model_args.model_name_or_path else None,
+            low_cpu_mem_usage=True,
+        )
+        alignment_reference.to(training_args.alignment_reference_device)
+        alignment_reference.eval()
+        alignment_reference.requires_grad_(False)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -598,6 +774,7 @@ def main():
                 train_dataset = train_dataset.select(range(max_train_samples))
 
     if training_args.do_eval:
+        import evaluate
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = lm_datasets["validation"]
@@ -629,12 +806,15 @@ def main():
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        # Data collator will default to DataCollatorWithPadding, so we change it.
         data_collator=default_data_collator,
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
         if training_args.do_eval and not is_torch_tpu_available()
         else None,
+        alignment_loss_weight=training_args.alignment_loss_weight,
+        alignment_reference_model=alignment_reference,
+        kgw_gamma=alignment_gamma,
+        kgw_seeding_scheme=alignment_seeding_scheme,
     )
 
     # Training
